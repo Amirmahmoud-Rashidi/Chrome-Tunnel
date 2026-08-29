@@ -45,10 +45,12 @@ process.on("uncaughtException", (err) => {
 
 const { createNativeMessagingHost } = require("./native-messaging");
 const { createProxyServer } = require("./proxy-server");
+const { sendChunked, createChunkReassembler } = require("./chunking");
 
 const PORT = parseInt(process.env.PROXY_PORT || "8765", 10);
 
 const host = createNativeMessagingHost();
+const reassembler = createChunkReassembler();
 
 let proxyHandle;
 try {
@@ -56,7 +58,7 @@ try {
     port: PORT,
     sendToExtension: (job) => {
       console.error("[host.js] forwarding job to extension:", job.id, job.method, job.url);
-      host.send(job);
+      sendChunked(host.send, job, "host");
     },
   });
 } catch (err) {
@@ -98,7 +100,12 @@ const { handleExtensionResponse } = proxyHandle;
 
 console.error("[host.js] native messaging host started, waiting for messages...");
 
-host.onMessage((message) => {
+host.onMessage((rawMessage) => {
+  const message = reassembler.handle(rawMessage);
+  if (message === null) {
+    return; // still waiting for more chunks of this message
+  }
+
   if (message && message.ping) {
     console.error("[host.js] received ping:", message.id);
     host.send({ id: message.id, pong: true, time: Date.now() });
