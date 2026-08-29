@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "chrometunnel",
+  "version": "1.0.0",
+  "description": "Tunnels HTTP/HTTPS traffic from CLI tools (git, npm, pip) and other apps through Chrome's network stack, so it passes through whatever proxy extension (VPN, etc.) Chrome is using.",
+  "permissions": ["nativeMessaging", "alarms", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
