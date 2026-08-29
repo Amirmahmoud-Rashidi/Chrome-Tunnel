@@ -23,6 +23,14 @@ const SESSION_KEY_CONNECTED = "chrometunnel_connected";
 
 let port = null;
 
+// Responses that were ready to send but the native port was disconnected
+// at that moment (e.g. mid-idle-cycle). Buffered here and flushed once we
+// reconnect, instead of being silently dropped — this was the cause of
+// requests (like Copilot Chat calls) appearing to hang or fail even
+// though the actual fetch() succeeded and a response was ready.
+const pendingResponses = [];
+const MAX_PENDING_RESPONSES = 200; // safety cap so a long outage can't grow this unbounded
+
 // ---- Keep-alive -----------------------------------------------------------
 // MV3 service workers are killed when idle. A periodic alarm wakes this
 // script back up. We do NOT blindly reconnect on every wake — only if we
@@ -85,6 +93,18 @@ function connect() {
   });
 
   console.log("[chrometunnel] connected to native host:", NATIVE_HOST_NAME);
+
+  // Flush anything that piled up while we were disconnected.
+  flushPendingResponses();
+}
+
+function flushPendingResponses() {
+  if (pendingResponses.length === 0) return;
+  console.log(`[chrometunnel] flushing ${pendingResponses.length} buffered response(s) after reconnect`);
+  const toSend = pendingResponses.splice(0, pendingResponses.length);
+  for (const message of toSend) {
+    sendToNative(message);
+  }
 }
 
 // ---- Message handling -------------------------------------------------------
@@ -148,13 +168,24 @@ async function handleNativeMessage(message) {
 
 function sendToNative(message) {
   if (!port) {
-    console.error("[chrometunnel] cannot send, native port is not connected:", message);
+    console.warn("[chrometunnel] native port not connected, buffering response:", message.id);
+    pendingResponses.push(message);
+    if (pendingResponses.length > MAX_PENDING_RESPONSES) {
+      // Drop the oldest one rather than growing forever if the native
+      // host stays unreachable for a long time.
+      const dropped = pendingResponses.shift();
+      console.error("[chrometunnel] pending response buffer full, dropping oldest:", dropped.id);
+    }
+    // Nudge a reconnect attempt now rather than waiting for the next
+    // keep-alive alarm tick, so buffered responses get flushed sooner.
+    ensureConnected();
     return;
   }
   try {
     port.postMessage(message);
   } catch (err) {
-    console.error("[chrometunnel] postMessage failed:", err);
+    console.error("[chrometunnel] postMessage failed, buffering for retry:", err);
+    pendingResponses.push(message);
   }
 }
 
