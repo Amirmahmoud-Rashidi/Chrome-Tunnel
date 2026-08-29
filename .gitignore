@@ -1,0 +1,4 @@
+node_modules/
+native-host/ca/
+native-host/host-error.log
+*.log
