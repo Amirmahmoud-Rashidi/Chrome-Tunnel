@@ -65,19 +65,32 @@ try {
 }
 
 // createProxyServer's server.listen() can fail asynchronously (e.g. the
-// port is already in use by a leftover process). Without this handler,
-// Node treats an unhandled 'error' event as fatal and the whole process
-// dies immediately and silently from Chrome's point of view.
+// port is already in use by a leftover process that hasn't fully exited
+// yet). proxy-server.js retries a few times internally with backoff for
+// exactly this case. This handler logs every attempt's error and only
+// gives up (exits) once retries are exhausted — determined by checking
+// whether the server ever successfully starts listening.
+let hasStartedListening = false;
+proxyHandle.server.once("listening", () => {
+  hasStartedListening = true;
+});
+
 proxyHandle.server.on("error", (err) => {
   logToFile(`proxy server error (port ${PORT})`, err);
   if (err.code === "EADDRINUSE") {
-    console.error(
-      `[host.js] Port ${PORT} is already in use by another process. ` +
-        `This usually means a previous host.js instance didn't shut down ` +
-        `cleanly. Close it (Task Manager or 'taskkill /IM node.exe /F') ` +
-        `and reconnect the extension.`
-    );
+    console.error(`[host.js] port ${PORT} in use, proxy-server.js will retry automatically.`);
+    // Give proxy-server.js's internal retry loop a chance; only exit if,
+    // after a generous window, we still never reached "listening".
+    setTimeout(() => {
+      if (!hasStartedListening) {
+        logToFile(`proxy server error (port ${PORT})`, new Error("Exhausted retries, giving up."));
+        console.error(`[host.js] giving up on port ${PORT} after retries exhausted.`);
+        process.exit(1);
+      }
+    }, 4000);
+    return;
   }
+  // Any other error is not something we know how to recover from.
   process.exit(1);
 });
 
