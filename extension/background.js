@@ -21,7 +21,29 @@
 const NATIVE_HOST_NAME = "local.chrometunnel.host";
 const SESSION_KEY_CONNECTED = "chrometunnel_connected";
 
+// Chrome enforces an undocumented ~1MB cap on a single native-messaging
+// payload. Sending anything larger causes the port to silently disconnect
+// ("Error when communicating with the native messaging host"), which is
+// what was happening whenever VS Code / Marketplace / Copilot fetched a
+// response bigger than that (a VSIX package, a large API response, etc).
+// To work around it, any outgoing message larger than this threshold is
+// split into multiple chunks and reassembled on the other end. Kept well
+// under 1MB for safety margin (base64 body + JSON overhead).
+const CHUNK_THRESHOLD_BYTES = 800 * 1024;
+const CHUNK_SIZE_BYTES = 700 * 1024;
+
 let port = null;
+
+// Synchronous guard against overlapping connect attempts. ensureConnected
+// is async (it awaits chrome.storage.session), so if several callers
+// (e.g. many sendToNative() calls firing in quick succession while
+// disconnected) all call it before the first one finishes, they can all
+// pass the `if (port) return` check before `port` is actually set —
+// each one then calls connectNative() and Chrome launches a SEPARATE
+// host.js process for each, all fighting over the same TCP port. This
+// flag is set synchronously the instant we decide to connect, closing
+// that window.
+let connectInFlight = false;
 
 // Responses that were ready to send but the native port was disconnected
 // at that moment (e.g. mid-idle-cycle). Buffered here and flushed once we
@@ -30,6 +52,12 @@ let port = null;
 // though the actual fetch() succeeded and a response was ready.
 const pendingResponses = [];
 const MAX_PENDING_RESPONSES = 200; // safety cap so a long outage can't grow this unbounded
+
+// Buffer for reassembling incoming chunked messages (large request bodies
+// coming from the native host), keyed by chunkId. Each entry collects
+// parts until `total` have arrived, then reassembles and processes it as
+// a normal message.
+const incomingChunkBuffers = new Map();
 
 // ---- Keep-alive -----------------------------------------------------------
 // MV3 service workers are killed when idle. A periodic alarm wakes this
@@ -53,21 +81,25 @@ chrome.runtime.onInstalled.addListener(ensureConnected);
 
 async function ensureConnected() {
   if (port) return; // this service worker instance already has a live port
+  if (connectInFlight) return; // another caller is already in the middle of connecting
 
-  // Guard against a fresh service-worker instance reconnecting while a
-  // previous instance's port is still actually alive (can happen right
-  // around a worker restart). chrome.storage.session persists across
-  // worker restarts within the same browser session.
-  const stored = await chrome.storage.session.get(SESSION_KEY_CONNECTED);
-  if (stored[SESSION_KEY_CONNECTED]) {
-    // We believe a connection is already active elsewhere; do nothing.
-    // If that belief is wrong (the other instance actually died without
-    // updating storage), onDisconnect handling below will have cleared
-    // this flag already in the normal case.
-    return;
+  connectInFlight = true; // set synchronously, before any await, to close the race
+
+  try {
+    // Guard against a fresh service-worker instance reconnecting while a
+    // previous instance's port is still actually alive (can happen right
+    // around a worker restart). chrome.storage.session persists across
+    // worker restarts within the same browser session.
+    const stored = await chrome.storage.session.get(SESSION_KEY_CONNECTED);
+    if (stored[SESSION_KEY_CONNECTED]) {
+      // We believe a connection is already active elsewhere; do nothing.
+      return;
+    }
+
+    connect();
+  } finally {
+    connectInFlight = false;
   }
-
-  connect();
 }
 
 function connect() {
@@ -110,13 +142,40 @@ function flushPendingResponses() {
 // ---- Message handling -------------------------------------------------------
 
 async function handleNativeMessage(message) {
-  // Manual test messages (step 1 of the rollout plan) can just be
-  // { id, ping: true } — handle that before assuming it's a fetch job.
   if (!message || typeof message !== "object") {
     console.warn("[chrometunnel] ignoring malformed message:", message);
     return;
   }
 
+  // Chunked message reassembly: a large payload sent by proxy-server.js
+  // arrives as multiple {chunkId, seq, total, data} messages instead of
+  // one. Buffer parts until all have arrived, then reassemble into the
+  // real JSON message and process it exactly as if it had arrived whole.
+  if (message.chunkId) {
+    const { chunkId, seq, total, data } = message;
+    let buf = incomingChunkBuffers.get(chunkId);
+    if (!buf) {
+      buf = new Array(total).fill(null);
+      incomingChunkBuffers.set(chunkId, buf);
+    }
+    buf[seq] = data;
+
+    if (buf.every((part) => part !== null)) {
+      incomingChunkBuffers.delete(chunkId);
+      let reassembled;
+      try {
+        reassembled = JSON.parse(buf.join(""));
+      } catch (err) {
+        console.error("[chrometunnel] failed to reassemble chunked message:", chunkId, err);
+        return;
+      }
+      return handleNativeMessage(reassembled);
+    }
+    return; // wait for the remaining chunks
+  }
+
+  // Manual test messages (step 1 of the rollout plan) can just be
+  // { id, ping: true } — handle that before assuming it's a fetch job.
   const { id, ping, url, method, headers, body } = message;
 
   if (ping) {
@@ -181,10 +240,34 @@ function sendToNative(message) {
     ensureConnected();
     return;
   }
+
+  const json = JSON.stringify(message);
+
+  if (json.length <= CHUNK_THRESHOLD_BYTES) {
+    try {
+      port.postMessage(message);
+    } catch (err) {
+      console.error("[chrometunnel] postMessage failed, buffering for retry:", err);
+      pendingResponses.push(message);
+    }
+    return;
+  }
+
+  // Message is too large for a single native-messaging payload (see the
+  // CHUNK_THRESHOLD_BYTES comment above) — split it into parts. Each part
+  // carries the same chunkId so the native host can reassemble them, plus
+  // its position (seq) and the total part count.
+  const chunkId = `ext-${message.id || Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const total = Math.ceil(json.length / CHUNK_SIZE_BYTES);
+  console.log(`[chrometunnel] message for ${chunkId} is ${json.length} bytes, splitting into ${total} chunks`);
+
   try {
-    port.postMessage(message);
+    for (let seq = 0; seq < total; seq++) {
+      const data = json.slice(seq * CHUNK_SIZE_BYTES, (seq + 1) * CHUNK_SIZE_BYTES);
+      port.postMessage({ chunkId, seq, total, data });
+    }
   } catch (err) {
-    console.error("[chrometunnel] postMessage failed, buffering for retry:", err);
+    console.error("[chrometunnel] postMessage failed mid-chunk, buffering whole message for retry:", err);
     pendingResponses.push(message);
   }
 }
