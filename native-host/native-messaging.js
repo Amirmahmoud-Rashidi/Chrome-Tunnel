@@ -22,17 +22,51 @@ const HEADER_LENGTH = 4;
 function createNativeMessagingHost() {
   const listeners = [];
   let inputBuffer = Buffer.alloc(0);
+  let stdoutBroken = false;
+
+  // A broken pipe (Chrome closed its end, e.g. because the service worker
+  // was killed) can surface as an 'error' event on stdout asynchronously,
+  // separately from any exception thrown directly by write(). Without
+  // this listener, Node treats an unhandled stream error as fatal and
+  // kills the whole process — which causes a crash loop: EPIPE -> process
+  // dies -> Chrome relaunches host.js -> repeats, dropping any in-flight
+  // responses along the way.
+  process.stdout.on("error", (err) => {
+    if (err && err.code === "EPIPE") {
+      stdoutBroken = true;
+      console.error(
+        "[native-host] stdout pipe broken (Chrome disconnected); shutting down " +
+          "cleanly so the port is free for the next instance Chrome launches."
+      );
+      process.exit(0);
+    } else {
+      console.error("[native-host] unexpected stdout error:", err);
+    }
+  });
 
   function onMessage(callback) {
     listeners.push(callback);
   }
 
   function send(messageObj) {
-    const json = JSON.stringify(messageObj);
-    const jsonBuffer = Buffer.from(json, "utf8");
-    const header = Buffer.alloc(HEADER_LENGTH);
-    header.writeUInt32LE(jsonBuffer.length, 0);
-    process.stdout.write(Buffer.concat([header, jsonBuffer]));
+    if (stdoutBroken) {
+      console.error("[native-host] dropping message, stdout is broken:", messageObj.id);
+      return;
+    }
+    try {
+      const json = JSON.stringify(messageObj);
+      const jsonBuffer = Buffer.from(json, "utf8");
+      const header = Buffer.alloc(HEADER_LENGTH);
+      header.writeUInt32LE(jsonBuffer.length, 0);
+      process.stdout.write(Buffer.concat([header, jsonBuffer]));
+    } catch (err) {
+      // Synchronous throw path — some Node versions/platforms surface
+      // EPIPE here instead of via the async 'error' event above.
+      console.error("[native-host] failed to write to stdout:", err.message);
+      if (err && err.code === "EPIPE") {
+        stdoutBroken = true;
+      }
+    }
   }
 
   function tryParseBuffer() {
