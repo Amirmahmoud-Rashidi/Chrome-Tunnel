@@ -68,7 +68,7 @@ This only affects TLS connections made *to 127.0.0.1* by clients you
 configure to trust it — nothing is installed system-wide beyond the
 current user's certificate store, and no other traffic is intercepted.
 
-### 4. Point your tools at the proxy(optional, for who do not know how to set proxy
+### 4. Point your tools at the proxy(optional, For who do not know how to set proxy)
 
 ```powershell
 # npm
@@ -115,7 +115,7 @@ native-host/    Node.js native messaging host + local HTTP/HTTPS proxy
 
 ## Important note
 
-Please toggle off the extension after using it and terminate the listetning on its port with command to prevent of bieng stucked in loop to make a listening on specified port
+### Please toggle off the extension after using it and terminate the listetning on its port with command to prevent of bieng stucked in loop to make a listening on specified port
 1. First find the PID
 ```powershell
 netstat -ano | findstr :8765
@@ -124,3 +124,64 @@ netstat -ano | findstr :8765
 ```powershell
 taskkill /PID <number> /F
 ```
+### Also consider this tool can not tunnel all request correctly and some request may be failed.
+## Uninstall the tool
+
+### 1. Remove the extension from Chrome
+`chrome://extensions` → click the chrometunnel extension → **Remove**
+
+### 2. Remove the native messaging registry key
+```powershell
+Remove-Item -Path "HKCU:\Software\Google\Chrome\NativeMessagingHosts\local.chrometunnel.host" -Recurse
+```
+
+### 3. Remove the CA certificate from the Windows Certificate Store
+- Run `certmgr.msc`
+- Certificates - Current User → Trusted Root Certification Authorities → Certificates
+- Find the certificate named **"chrometunnel Local CA"**, right-click → **Delete**
+
+### 4. Remove the proxy/CA settings from your tools(Optional, For who do not know how to restore settings)
+```powershell
+# npm
+npm config delete proxy
+npm config delete https-proxy
+npm config delete cafile
+
+# git
+git config --global --unset http.proxy
+git config --global --unset https.proxy
+git config --global --unset http.sslCAInfo
+
+# pip / env vars (current session only; see below if set permanently with setx)
+Remove-Item Env:\HTTP_PROXY -ErrorAction SilentlyContinue
+Remove-Item Env:\HTTPS_PROXY -ErrorAction SilentlyContinue
+Remove-Item Env:\REQUESTS_CA_BUNDLE -ErrorAction SilentlyContinue
+```
+
+If you made them permanent with `setx`:
+```powershell
+[Environment]::SetEnvironmentVariable("HTTP_PROXY", $null, "User")
+[Environment]::SetEnvironmentVariable("HTTPS_PROXY", $null, "User")
+[Environment]::SetEnvironmentVariable("REQUESTS_CA_BUNDLE", $null, "User")
+```
+
+### 5. Remove the VS Code settings(Optional, For who do not know how to restore settings)
+Delete these lines from `settings.json`:
+```json
+"http.proxy": "http://127.0.0.1:8765",
+"http.proxySupport": "on",
+"http.proxyStrictSSL": false
+```
+
+### 6. Kill any remaining node processes
+1. First find the PID
+```powershell
+netstat -ano | findstr :8765
+```
+2. Then with PID and this command, terminate it
+```powershell
+taskkill /PID <number> /F
+```
+
+### 7. Delete the project folder
+Delete the `chrometunnel` folder (including `native-host/ca/`, which holds the CA's private key).
