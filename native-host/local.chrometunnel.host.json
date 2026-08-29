@@ -1,0 +1,9 @@
+{
+  "name": "local.chrometunnel.host",
+  "description": "chrometunnel native host",
+  "path": "REPLACE_WITH_ABSOLUTE_PATH\\host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
+  ]
+}
