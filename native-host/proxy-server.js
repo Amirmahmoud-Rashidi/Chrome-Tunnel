@@ -267,9 +267,39 @@ function createProxyServer({ port, sendToExtension }) {
     tlsSocket.end(responseBody);
   }
 
-  server.listen(port, "127.0.0.1", () => {
+  // If a previous host.js instance just exited (e.g. after Chrome's
+  // service worker died and we detected the broken pipe), Windows/Node
+  // may take a brief moment to fully release the port. Retry a few times
+  // with backoff instead of giving up immediately on the first
+  // EADDRINUSE, which previously caused a hard crash-loop.
+  let listenAttempts = 0;
+  const MAX_LISTEN_ATTEMPTS = 5;
+
+  function tryListen() {
+    listenAttempts++;
+    server.listen(port, "127.0.0.1");
+  }
+
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE" && listenAttempts < MAX_LISTEN_ATTEMPTS) {
+      const delayMs = 500 * listenAttempts;
+      console.error(
+        `[proxy-server] port ${port} still in use (attempt ${listenAttempts}/${MAX_LISTEN_ATTEMPTS}), ` +
+          `retrying in ${delayMs}ms...`
+      );
+      setTimeout(tryListen, delayMs);
+    }
+    // If retries are exhausted or it's some other error, let it propagate
+    // to whatever error listener the caller (host.js) attaches, which
+    // logs it and exits — that's still the right behavior for anything
+    // that isn't a transient post-exit port hold.
+  });
+
+  server.once("listening", () => {
     console.error(`[proxy-server] listening on http://127.0.0.1:${port}`);
   });
+
+  tryListen();
 
   return { server, handleExtensionResponse };
 }
