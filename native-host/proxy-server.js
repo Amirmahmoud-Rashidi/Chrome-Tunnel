@@ -25,12 +25,64 @@
 // This module owns the id -> pending response map, since it's the piece
 // that both sends jobs into native messaging and needs to resolve them
 // when a matching response comes back.
-
 const http = require("http");
 const tls = require("tls");
 const crypto = require("crypto");
 const { getCertificateForHost } = require("./tls-mitm");
 const { logFailedRequest } = require("./failure-logger");
+
+const MARKETPLACE_HOSTNAME = "marketplace.visualstudio.com";
+
+function isMarketplaceUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase() === MARKETPLACE_HOSTNAME;
+  } catch {
+    return false;
+  }
+}
+
+function isMarketplaceCorsPreflight(url, method, headers) {
+  return (
+    isMarketplaceUrl(url) &&
+    String(method || "").toUpperCase() === "OPTIONS" &&
+    Boolean(headers && headers["origin"]) &&
+    Boolean(headers && headers["access-control-request-method"])
+  );
+}
+
+function buildCorsPreflightHeaders(requestHeaders) {
+  const responseHeaders = {
+    "access-control-allow-origin": requestHeaders["origin"],
+    "access-control-allow-methods": requestHeaders["access-control-request-method"],
+    "access-control-allow-credentials": "true",
+    "access-control-max-age": "600",
+    "content-length": "0",
+    "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+  };
+
+  if (requestHeaders["access-control-request-headers"]) {
+    responseHeaders["access-control-allow-headers"] = requestHeaders["access-control-request-headers"];
+  }
+
+  return responseHeaders;
+}
+
+function applyMarketplaceCorsResponseHeaders(responseHeaders, context) {
+  if (!isMarketplaceUrl(context.url)) return;
+
+  const requestOrigin = context.requestHeaders && context.requestHeaders["origin"];
+  if (!requestOrigin) return;
+
+  responseHeaders["access-control-allow-origin"] = requestOrigin;
+  responseHeaders["access-control-allow-credentials"] = "true";
+
+  const existingVary = responseHeaders["vary"];
+  if (!existingVary) {
+    responseHeaders["vary"] = "Origin";
+  } else if (!String(existingVary).split(",").some((value) => value.trim().toLowerCase() === "origin")) {
+    responseHeaders["vary"] = `${existingVary}, Origin`;
+  }
+}
 
 /**
  * @param {object} opts
@@ -43,7 +95,6 @@ function createProxyServer({ port, sendToExtension }) {
   // Map of request id -> { resolve, reject } for in-flight requests.
   // Shared between the plain-HTTP path and the CONNECT/MITM path.
   const pending = new Map();
-
   function handleExtensionResponse(message) {
     const { id } = message || {};
     if (!id || !pending.has(id)) {
@@ -54,7 +105,6 @@ function createProxyServer({ port, sendToExtension }) {
     pending.delete(id);
     resolve(message);
   }
-
   /**
    * Sends {method, url, headers, body} to the extension and resolves with
    * the extension's {status, statusText, headers, body} or rejects on
@@ -62,7 +112,6 @@ function createProxyServer({ port, sendToExtension }) {
    */
   function relayToExtension({ url, method, headers, bodyBuffer }) {
     const id = crypto.randomUUID();
-
     const forwardHeaders = { ...headers };
     delete forwardHeaders["proxy-connection"];
     delete forwardHeaders["connection"];
@@ -73,7 +122,6 @@ function createProxyServer({ port, sendToExtension }) {
     if (bodyBuffer && bodyBuffer.length > 0) {
       job.body = bodyBuffer.toString("base64");
     }
-
     const responsePromise = new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
       setTimeout(() => {
@@ -89,7 +137,6 @@ function createProxyServer({ port, sendToExtension }) {
   }
 
   // ---- Case 1: absolute-form plain HTTP ------------------------------------
-
   const server = http.createServer((req, res) => {
     const targetUrl = req.url;
 
@@ -103,15 +150,31 @@ function createProxyServer({ port, sendToExtension }) {
       return;
     }
 
+    // VS Code's browser-side Marketplace client performs CORS preflights.
+    // The Marketplace endpoint itself returns 404 for those OPTIONS calls,
+    // so terminate only genuine Marketplace preflights locally. This lets
+    // VS Code proceed to the real GET/POST, which is then relayed normally.
+    if (isMarketplaceCorsPreflight(targetUrl, req.method, req.headers)) {
+      req.resume();
+      res.writeHead(204, buildCorsPreflightHeaders(req.headers));
+      res.end();
+      return;
+    }
+
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("error", (err) => {
       console.error("[proxy-server] request stream error:", err);
     });
-
     req.on("end", async () => {
       const bodyBuffer = Buffer.concat(chunks);
       const clientOrigin = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
+      const context = {
+        method: req.method,
+        url: targetUrl,
+        origin: clientOrigin,
+        requestHeaders: req.headers,
+      };
       try {
         const result = await relayToExtension({
           url: targetUrl,
@@ -119,7 +182,7 @@ function createProxyServer({ port, sendToExtension }) {
           headers: req.headers,
           bodyBuffer,
         });
-        writeHttpResult(res, result, { method: req.method, url: targetUrl, origin: clientOrigin });
+        writeHttpResult(res, result, context);
       } catch (err) {
         console.error("[proxy-server] request failed:", err.message);
         logFailedRequest({
@@ -134,7 +197,6 @@ function createProxyServer({ port, sendToExtension }) {
       }
     });
   });
-
   function writeHttpResult(res, result, context) {
     if (result.error) {
       logFailedRequest({
@@ -164,17 +226,16 @@ function createProxyServer({ port, sendToExtension }) {
     const headersToSend = { ...(result.headers || {}) };
     delete headersToSend["content-length"];
     delete headersToSend["content-encoding"]; // fetch() already decoded the body
+    applyMarketplaceCorsResponseHeaders(headersToSend, context);
     res.writeHead(result.status || 502, headersToSend);
     res.end(responseBody);
   }
-
   // ---- Case 2: CONNECT -> local TLS termination (MITM) ---------------------
 
   server.on("connect", (req, clientSocket, head) => {
     // req.url is like "example.com:443"
     const [hostname] = req.url.split(":");
     console.error(`[proxy-server] CONNECT ${req.url}`);
-
     let cert;
     try {
       cert = getCertificateForHost(hostname);
@@ -184,7 +245,6 @@ function createProxyServer({ port, sendToExtension }) {
       clientSocket.end();
       return;
     }
-
     // Tell the client the tunnel is established, THEN start TLS on top of
     // this same socket. Some clients send `head` bytes already read by
     // Node's HTTP parser before the upgrade — most callers get an empty
@@ -196,31 +256,27 @@ function createProxyServer({ port, sendToExtension }) {
       key: cert.keyPem,
       cert: cert.certPem,
     });
-
     if (head && head.length > 0) {
       tlsSocket.unshift(head);
     }
-
     tlsSocket.on("error", (err) => {
-      // Very common/benign: client aborts, or doesn't trust our CA yet.
-      // Still logged as a failure per the "log every failure" policy —
-      // no exceptions carved out, even for expected/frequent cases.
+      // This listener covers the entire lifetime of the TLS socket, not
+      // only the handshake. A client may reset an already-established TLS
+      // connection after an HTTP response, so classify it as a socket error.
       console.error(`[proxy-server] TLS error for ${hostname}:`, err.message);
       logFailedRequest({
-        source: "tls-handshake",
+        source: "tls-socket",
         url: `https://${hostname}`,
         origin: `client:${req.socket.remoteAddress}:${req.socket.remotePort}`,
         reason: err.message,
       });
     });
-
     // Parse the plaintext HTTP request(s) the client sends inside the
     // now-decrypted TLS stream. We do this manually with a tiny buffer
     // parser rather than spinning up a second http.Server per connection,
     // to keep this self-contained and easy to reason about.
     handleDecryptedHttpStream(tlsSocket, hostname, clientSocket);
   });
-
   function handleDecryptedHttpStream(tlsSocket, hostname, clientSocket) {
     let buffer = Buffer.alloc(0);
     const clientOrigin = `${clientSocket.remoteAddress}:${clientSocket.remotePort}`;
@@ -233,12 +289,10 @@ function createProxyServer({ port, sendToExtension }) {
     function tryParseAndHandleRequest() {
       const headerEnd = buffer.indexOf("\r\n\r\n");
       if (headerEnd === -1) return; // headers not fully received yet
-
       const headerText = buffer.subarray(0, headerEnd).toString("utf8");
       const lines = headerText.split("\r\n");
       const requestLine = lines[0];
       const [method, path] = requestLine.split(" ");
-
       const headers = {};
       for (let i = 1; i < lines.length; i++) {
         const idx = lines[i].indexOf(":");
@@ -250,7 +304,6 @@ function createProxyServer({ port, sendToExtension }) {
 
       const contentLength = parseInt(headers["content-length"] || "0", 10);
       const bodyStart = headerEnd + 4;
-
       if (buffer.length - bodyStart < contentLength) {
         return; // body not fully received yet
       }
@@ -261,9 +314,20 @@ function createProxyServer({ port, sendToExtension }) {
       buffer = buffer.subarray(bodyStart + contentLength);
 
       const targetUrl = `https://${hostname}${path.startsWith("/") ? path : "/" + path}`;
+      const context = { method, url: targetUrl, origin: clientOrigin, requestHeaders: headers };
+
+      if (isMarketplaceCorsPreflight(targetUrl, method, headers)) {
+        const responseHeaders = buildCorsPreflightHeaders(headers);
+        responseHeaders["connection"] = "close";
+        const headerLines = Object.entries(responseHeaders)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join("\r\n");
+        tlsSocket.end(`HTTP/1.1 204 No Content\r\n${headerLines}\r\n\r\n`);
+        return;
+      }
 
       relayToExtension({ url: targetUrl, method, headers, bodyBuffer })
-        .then((result) => writeTlsResult(tlsSocket, result, { method, url: targetUrl, origin: clientOrigin }))
+        .then((result) => writeTlsResult(tlsSocket, result, context))
         .catch((err) => {
           console.error("[proxy-server] MITM request failed:", err.message);
           logFailedRequest({
@@ -276,17 +340,15 @@ function createProxyServer({ port, sendToExtension }) {
           writeTlsResult(
             tlsSocket,
             { status: 502, error: err.message, alreadyLogged: true },
-            { method, url: targetUrl, origin: clientOrigin }
+            context
           );
         });
-
       // If there's more pipelined data left in the buffer, try again.
       if (buffer.length > 0) {
         tryParseAndHandleRequest();
       }
     }
   }
-
   function writeTlsResult(tlsSocket, result, context) {
     if (result.error) {
       // Already logged by the .catch() above when this came from a
@@ -310,7 +372,6 @@ function createProxyServer({ port, sendToExtension }) {
       tlsSocket.end();
       return;
     }
-
     if (result.status >= 400) {
       logFailedRequest({
         source: "http-status",
@@ -322,15 +383,14 @@ function createProxyServer({ port, sendToExtension }) {
         reason: result.statusText,
       });
     }
-
     const responseBody = result.body ? Buffer.from(result.body, "base64") : Buffer.alloc(0);
     const headers = { ...(result.headers || {}) };
     delete headers["content-length"];
     delete headers["content-encoding"];
     delete headers["transfer-encoding"];
+    applyMarketplaceCorsResponseHeaders(headers, context);
     headers["content-length"] = String(responseBody.length);
     headers["connection"] = "close"; // keep this per-connection logic simple
-
     const statusLine = `HTTP/1.1 ${result.status || 502} ${result.statusText || ""}`.trimEnd();
     const headerLines = Object.entries(headers)
       .map(([k, v]) => `${k}: ${v}`)
@@ -339,7 +399,6 @@ function createProxyServer({ port, sendToExtension }) {
     tlsSocket.write(`${statusLine}\r\n${headerLines}\r\n\r\n`);
     tlsSocket.end(responseBody);
   }
-
   // If a previous host.js instance just exited (e.g. after Chrome's
   // service worker died and we detected the broken pipe), Windows/Node
   // may take a brief moment to fully release the port. Retry a few times
@@ -352,7 +411,6 @@ function createProxyServer({ port, sendToExtension }) {
     listenAttempts++;
     server.listen(port, "127.0.0.1");
   }
-
   server.on("error", (err) => {
     if (err.code === "EADDRINUSE" && listenAttempts < MAX_LISTEN_ATTEMPTS) {
       const delayMs = 500 * listenAttempts;
@@ -367,7 +425,6 @@ function createProxyServer({ port, sendToExtension }) {
     // logs it and exits — that's still the right behavior for anything
     // that isn't a transient post-exit port hold.
   });
-
   server.once("listening", () => {
     console.error(`[proxy-server] listening on http://127.0.0.1:${port}`);
   });
