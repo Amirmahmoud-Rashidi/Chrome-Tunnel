@@ -30,6 +30,7 @@ const http = require("http");
 const tls = require("tls");
 const crypto = require("crypto");
 const { getCertificateForHost } = require("./tls-mitm");
+const { logFailedRequest } = require("./failure-logger");
 
 /**
  * @param {object} opts
@@ -110,6 +111,7 @@ function createProxyServer({ port, sendToExtension }) {
 
     req.on("end", async () => {
       const bodyBuffer = Buffer.concat(chunks);
+      const clientOrigin = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
       try {
         const result = await relayToExtension({
           url: targetUrl,
@@ -117,20 +119,46 @@ function createProxyServer({ port, sendToExtension }) {
           headers: req.headers,
           bodyBuffer,
         });
-        writeHttpResult(res, result);
+        writeHttpResult(res, result, { method: req.method, url: targetUrl, origin: clientOrigin });
       } catch (err) {
         console.error("[proxy-server] request failed:", err.message);
+        logFailedRequest({
+          source: "proxy-server",
+          method: req.method,
+          url: targetUrl,
+          origin: clientOrigin,
+          reason: err.message,
+        });
         res.writeHead(504, { "Content-Type": "text/plain" });
         res.end(`Proxy error: ${err.message}\n`);
       }
     });
   });
 
-  function writeHttpResult(res, result) {
+  function writeHttpResult(res, result, context) {
     if (result.error) {
+      logFailedRequest({
+        source: "extension",
+        id: result.id,
+        method: context.method,
+        url: context.url,
+        origin: context.origin,
+        reason: result.error,
+      });
       res.writeHead(502, { "Content-Type": "text/plain" });
       res.end(`Extension fetch failed: ${result.error}\n`);
       return;
+    }
+    if (result.status >= 400) {
+      logFailedRequest({
+        source: "http-status",
+        id: result.id,
+        method: context.method,
+        url: context.url,
+        origin: context.origin,
+        status: result.status,
+        reason: result.statusText,
+      });
     }
     const responseBody = result.body ? Buffer.from(result.body, "base64") : Buffer.alloc(0);
     const headersToSend = { ...(result.headers || {}) };
@@ -175,18 +203,27 @@ function createProxyServer({ port, sendToExtension }) {
 
     tlsSocket.on("error", (err) => {
       // Very common/benign: client aborts, or doesn't trust our CA yet.
+      // Still logged as a failure per the "log every failure" policy —
+      // no exceptions carved out, even for expected/frequent cases.
       console.error(`[proxy-server] TLS error for ${hostname}:`, err.message);
+      logFailedRequest({
+        source: "tls-handshake",
+        url: `https://${hostname}`,
+        origin: `client:${req.socket.remoteAddress}:${req.socket.remotePort}`,
+        reason: err.message,
+      });
     });
 
     // Parse the plaintext HTTP request(s) the client sends inside the
     // now-decrypted TLS stream. We do this manually with a tiny buffer
     // parser rather than spinning up a second http.Server per connection,
     // to keep this self-contained and easy to reason about.
-    handleDecryptedHttpStream(tlsSocket, hostname);
+    handleDecryptedHttpStream(tlsSocket, hostname, clientSocket);
   });
 
-  function handleDecryptedHttpStream(tlsSocket, hostname) {
+  function handleDecryptedHttpStream(tlsSocket, hostname, clientSocket) {
     let buffer = Buffer.alloc(0);
+    const clientOrigin = `${clientSocket.remoteAddress}:${clientSocket.remotePort}`;
 
     tlsSocket.on("data", (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
@@ -225,12 +262,22 @@ function createProxyServer({ port, sendToExtension }) {
 
       const targetUrl = `https://${hostname}${path.startsWith("/") ? path : "/" + path}`;
 
-
       relayToExtension({ url: targetUrl, method, headers, bodyBuffer })
-        .then((result) => writeTlsResult(tlsSocket, result))
+        .then((result) => writeTlsResult(tlsSocket, result, { method, url: targetUrl, origin: clientOrigin }))
         .catch((err) => {
           console.error("[proxy-server] MITM request failed:", err.message);
-          writeTlsResult(tlsSocket, { status: 502, error: err.message });
+          logFailedRequest({
+            source: "proxy-server",
+            method,
+            url: targetUrl,
+            origin: clientOrigin,
+            reason: err.message,
+          });
+          writeTlsResult(
+            tlsSocket,
+            { status: 502, error: err.message, alreadyLogged: true },
+            { method, url: targetUrl, origin: clientOrigin }
+          );
         });
 
       // If there's more pipelined data left in the buffer, try again.
@@ -240,14 +287,40 @@ function createProxyServer({ port, sendToExtension }) {
     }
   }
 
-  function writeTlsResult(tlsSocket, result) {
+  function writeTlsResult(tlsSocket, result, context) {
     if (result.error) {
+      // Already logged by the .catch() above when this came from a
+      // relayToExtension() rejection; but if the extension itself
+      // returned {error: ...} without going through the catch path,
+      // log it here so it's never missed.
+      if (!result.alreadyLogged) {
+        logFailedRequest({
+          source: "extension",
+          id: result.id,
+          method: context.method,
+          url: context.url,
+          origin: context.origin,
+          reason: result.error,
+        });
+      }
       const body = `Extension fetch failed: ${result.error}\n`;
       tlsSocket.write(
         `HTTP/1.1 502 Bad Gateway\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`
       );
       tlsSocket.end();
       return;
+    }
+
+    if (result.status >= 400) {
+      logFailedRequest({
+        source: "http-status",
+        id: result.id,
+        method: context.method,
+        url: context.url,
+        origin: context.origin,
+        status: result.status,
+        reason: result.statusText,
+      });
     }
 
     const responseBody = result.body ? Buffer.from(result.body, "base64") : Buffer.alloc(0);
