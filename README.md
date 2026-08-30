@@ -115,16 +115,7 @@ native-host/    Node.js native messaging host + local HTTP/HTTPS proxy
 
 ## Important note
 
-### Please toggle off the extension after using it and terminate the listetning on its port with command to prevent of bieng stucked in loop to make a listening on specified port
-1. First find the PID
-```powershell
-netstat -ano | findstr :8765
-```
-2. Then with PID and this command, terminate it
-```powershell
-taskkill /PID <number> /F
-```
-### Also consider this tool can not tunnel all request correctly and some request may be failed.
+### Consider this tool can not tunnel all request correctly and some request may be failed. For seeing problem check (requests-failed.log) file on native-host folder
 ## Uninstall the tool
 
 ### 1. Remove the extension from Chrome
