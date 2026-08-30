@@ -59,6 +59,31 @@ const MAX_PENDING_RESPONSES = 200; // safety cap so a long outage can't grow thi
 // a normal message.
 const incomingChunkBuffers = new Map();
 
+// Concurrency limiter for outgoing fetch() calls. A burst of many
+// simultaneous requests (e.g. VS Code's Marketplace check, which fires
+// 25+ parallel "get latest version" calls at once) was overwhelming the
+// service worker and causing it to be forcibly terminated by Chrome —
+// not from normal 30s idle timeout, but from the sheer number of
+// concurrent in-flight fetch()es and their callbacks. Limiting how many
+// run at once keeps the worker responsive. No request is dropped: excess
+// jobs simply wait in a FIFO queue until a slot frees up.
+const MAX_CONCURRENT_FETCHES = 6;
+let activeFetchCount = 0;
+const fetchQueue = [];
+
+function runWithConcurrencyLimit(task) {
+  if (activeFetchCount < MAX_CONCURRENT_FETCHES) {
+    activeFetchCount++;
+    task().finally(() => {
+      activeFetchCount--;
+      const next = fetchQueue.shift();
+      if (next) runWithConcurrencyLimit(next);
+    });
+  } else {
+    fetchQueue.push(task);
+  }
+}
+
 // ---- Keep-alive -----------------------------------------------------------
 // MV3 service workers are killed when idle. A periodic alarm wakes this
 // script back up. We do NOT blindly reconnect on every wake — only if we
@@ -188,41 +213,43 @@ async function handleNativeMessage(message) {
     return;
   }
 
-  try {
-    const fetchOptions = {
-      method: method || "GET",
-      headers: headers || {},
-    };
+  runWithConcurrencyLimit(async () => {
+    try {
+      const fetchOptions = {
+        method: method || "GET",
+        headers: headers || {},
+      };
 
-    // body may arrive as a base64 string for binary-safety; decode if present.
-    if (body) {
-      fetchOptions.body = base64ToUint8Array(body);
+      // body may arrive as a base64 string for binary-safety; decode if present.
+      if (body) {
+        fetchOptions.body = base64ToUint8Array(body);
+      }
+
+      const response = await fetch(url, fetchOptions);
+
+      const responseHeaders = {};
+      for (const [key, value] of response.headers.entries()) {
+        responseHeaders[key] = value;
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const bodyBase64 = uint8ArrayToBase64(new Uint8Array(arrayBuffer));
+
+      sendToNative({
+        id,
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+        body: bodyBase64,
+      });
+    } catch (err) {
+      console.error("[chrometunnel] fetch failed for", url, err);
+      sendToNative({
+        id,
+        error: err && err.message ? err.message : String(err),
+      });
     }
-
-    const response = await fetch(url, fetchOptions);
-
-    const responseHeaders = {};
-    for (const [key, value] of response.headers.entries()) {
-      responseHeaders[key] = value;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const bodyBase64 = uint8ArrayToBase64(new Uint8Array(arrayBuffer));
-
-    sendToNative({
-      id,
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
-      body: bodyBase64,
-    });
-  } catch (err) {
-    console.error("[chrometunnel] fetch failed for", url, err);
-    sendToNative({
-      id,
-      error: err && err.message ? err.message : String(err),
-    });
-  }
+  });
 }
 
 function sendToNative(message) {
