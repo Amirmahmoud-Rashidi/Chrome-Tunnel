@@ -1,17 +1,4 @@
-// protocols/http/index.js — absolute-form plain HTTP requests, e.g.
-// "GET http://example.com/foo".
-//
-// Rare in practice (curl/git/npm/pip all issue CONNECT even for
-// http.proxy-style config — see protocols/https/), but kept since it's
-// the simplest case and some clients/environments do use it for plain
-// http:// targets.
-//
-// attach(server, { relayToExtension }) registers this handler's request
-// listener on the shared http.Server owned by core/dispatcher.js. It
-// only claims requests that look like absolute-form HTTP; anything else
-// (CONNECT) is left for protocols/https/ to handle via its own 'connect'
-// listener on the same server.
-
+// protocols/http/index.js — absolute-form plain HTTP requests.
 const { logFailedRequest } = require("../../failure-logger");
 const {
   isMarketplaceCorsPreflight,
@@ -33,10 +20,6 @@ function attach(server, { relayToExtension }) {
       return;
     }
 
-    // VS Code's browser-side Marketplace client performs CORS preflights.
-    // The Marketplace endpoint itself returns 404 for those OPTIONS calls,
-    // so terminate only genuine Marketplace preflights locally. This lets
-    // VS Code proceed to the real GET/POST, which is then relayed normally.
     if (isMarketplaceCorsPreflight(targetUrl, req.method, req.headers)) {
       req.resume();
       res.writeHead(204, buildCorsPreflightHeaders(req.headers));
@@ -49,6 +32,7 @@ function attach(server, { relayToExtension }) {
     req.on("error", (err) => {
       console.error("[protocols/http] request stream error:", err);
     });
+
     req.on("end", async () => {
       const bodyBuffer = Buffer.concat(chunks);
       const clientOrigin = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
@@ -58,14 +42,33 @@ function attach(server, { relayToExtension }) {
         origin: clientOrigin,
         requestHeaders: req.headers,
       };
+
+      let streamed = false;
+
       try {
         const result = await relayToExtension({
           url: targetUrl,
           method: req.method,
           headers: req.headers,
           bodyBuffer,
+          onResponseStart: (start) => {
+            streamed = true;
+            writeHttpStreamStart(res, start, context);
+          },
+          onResponseChunk: (chunk) => {
+            if (!res.destroyed && !res.writableEnded && chunk.length > 0) {
+              res.write(chunk);
+            }
+          },
+          onResponseEnd: () => {
+            if (!res.destroyed && !res.writableEnded) res.end();
+          },
         });
-        writeHttpResult(res, result, context);
+
+        // Backward compatibility with the original one-message protocol.
+        if (!streamed && !result.streamed) {
+          writeHttpResult(res, result, context);
+        }
       } catch (err) {
         console.error("[protocols/http] request failed:", err.message);
         logFailedRequest({
@@ -75,11 +78,55 @@ function attach(server, { relayToExtension }) {
           origin: clientOrigin,
           reason: err.message,
         });
-        res.writeHead(504, { "Content-Type": "text/plain" });
-        res.end(`Proxy error: ${err.message}\n`);
+
+        if (!res.headersSent) {
+          res.writeHead(504, { "Content-Type": "text/plain" });
+          res.end(`Proxy error: ${err.message}\n`);
+        } else if (!res.destroyed) {
+          // Headers/body may already have been streamed. We cannot replace the
+          // HTTP status now; closing the incomplete stream correctly tells the
+          // client that the transfer did not finish successfully.
+          res.destroy(err);
+        }
       }
     });
   });
+}
+
+function sanitizeStreamHeaders(headers, context) {
+  const headersToSend = { ...(headers || {}) };
+  delete headersToSend["content-length"];
+  delete headersToSend["content-encoding"]; // browser fetch already decoded it
+  delete headersToSend["transfer-encoding"];
+  delete headersToSend["connection"];
+  applyMarketplaceCorsResponseHeaders(headersToSend, context);
+  return headersToSend;
+}
+
+function logHttpStatus(result, context) {
+  if (result.status >= 400) {
+    logFailedRequest({
+      source: "http-status",
+      id: result.id,
+      method: context.method,
+      url: context.url,
+      origin: context.origin,
+      status: result.status,
+      reason: result.statusText,
+    });
+  }
+}
+
+function writeHttpStreamStart(res, start, context) {
+  logHttpStatus(start, context);
+  const headersToSend = sanitizeStreamHeaders(start.headers, context);
+  res.writeHead(start.status || 502, headersToSend);
+  // Push response headers immediately so streaming clients do not wait for
+  // the first/body-final chunk before they consider the response started.
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+  if (res.socket && typeof res.socket.setNoDelay === "function") {
+    res.socket.setNoDelay(true);
+  }
 }
 
 function writeHttpResult(res, result, context) {
@@ -96,22 +143,12 @@ function writeHttpResult(res, result, context) {
     res.end(`Extension fetch failed: ${result.error}\n`);
     return;
   }
-  if (result.status >= 400) {
-    logFailedRequest({
-      source: "http-status",
-      id: result.id,
-      method: context.method,
-      url: context.url,
-      origin: context.origin,
-      status: result.status,
-      reason: result.statusText,
-    });
-  }
-  const responseBody = result.body ? Buffer.from(result.body, "base64") : Buffer.alloc(0);
-  const headersToSend = { ...(result.headers || {}) };
-  delete headersToSend["content-length"];
-  delete headersToSend["content-encoding"]; // fetch() already decoded the body
-  applyMarketplaceCorsResponseHeaders(headersToSend, context);
+
+  logHttpStatus(result, context);
+  const responseBody = result.body
+    ? Buffer.from(result.body, "base64")
+    : Buffer.alloc(0);
+  const headersToSend = sanitizeStreamHeaders(result.headers, context);
   res.writeHead(result.status || 502, headersToSend);
   res.end(responseBody);
 }
