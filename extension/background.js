@@ -29,11 +29,11 @@ const SESSION_KEY_CONNECTED = "chrometunnel_connected";
 // under 1MB for safety margin (base64 body + JSON overhead).
 const CHUNK_THRESHOLD_BYTES = 800 * 1024;
 const CHUNK_SIZE_BYTES = 700 * 1024;
-// Keep the extension's own deadline shorter than proxy-server.js's 30s
+// Keep the extension's own deadline shorter than relay.js's 60s
 // timeout, so a stuck fetch can be aborted and reported while the native
 // host is still waiting for the response. Time spent in the fetch queue
 // counts toward this same deadline.
-const REQUEST_TIMEOUT_MS = 25_000;
+const REQUEST_TIMEOUT_MS = 45_000;
 let port = null;
 // Synchronous guard against overlapping connect attempts. ensureConnected
 // is async (it awaits chrome.storage.session), so if several callers
