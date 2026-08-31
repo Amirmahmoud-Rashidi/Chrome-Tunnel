@@ -1,12 +1,17 @@
 #!/usr/bin/env node
-// host.js — Step 2 of the rollout plan: native messaging + local HTTP proxy.
+// host.js — native messaging + local request dispatcher.
 //
 // Two jobs running in this one process:
-//   1. Native messaging host (unchanged from step 1) — talks to the Chrome
+//   1. Native messaging host (native-messaging.js) — talks to the Chrome
 //      extension over stdin/stdout.
-//   2. HTTP proxy server (proxy-server.js) — listens on 127.0.0.1:PORT for
-//      curl/git/npm/pip/VS Code, forwards each request to the extension via
-//      native messaging, and returns the extension's fetch() result.
+//   2. Dispatcher (core/dispatcher.js) — listens on 127.0.0.1:PORT for
+//      curl/git/npm/pip/VS Code, classifies each incoming request, and
+//      routes it to the matching protocol handler under protocols/
+//      (currently protocols/http and protocols/https), which forwards it
+//      to the extension via native messaging and returns the extension's
+//      fetch() result. Adding a new request type later (e.g. WebSocket)
+//      means adding a new protocols/<name>/ folder — this file doesn't
+//      need to change.
 //
 // The {ping: true} test message from step 1 still works, for regression
 // testing the native-messaging link on its own.
@@ -113,15 +118,15 @@ function killStaleListenerOnPort(port) {
 killStaleListenerOnPort(PORT);
 
 const { createNativeMessagingHost } = require("./native-messaging");
-const { createProxyServer } = require("./proxy-server");
+const { createDispatcher } = require("./core/dispatcher");
 const { sendChunked, createChunkReassembler } = require("./chunking");
 
 const host = createNativeMessagingHost();
 const reassembler = createChunkReassembler();
 
-let proxyHandle;
+let dispatcherHandle;
 try {
-  proxyHandle = createProxyServer({
+  dispatcherHandle = createDispatcher({
     port: PORT,
     sendToExtension: (job) => {
       console.error("[host.js] forwarding job to extension:", job.id, job.method, job.url);
@@ -129,30 +134,30 @@ try {
     },
   });
 } catch (err) {
-  logToFile("createProxyServer threw synchronously", err);
+  logToFile("createDispatcher threw synchronously", err);
   throw err;
 }
 
-// createProxyServer's server.listen() can fail asynchronously (e.g. the
+// createDispatcher's server.listen() can fail asynchronously (e.g. the
 // port is already in use by a leftover process that hasn't fully exited
-// yet). proxy-server.js retries a few times internally with backoff for
-// exactly this case. This handler logs every attempt's error and only
-// gives up (exits) once retries are exhausted — determined by checking
-// whether the server ever successfully starts listening.
+// yet). core/dispatcher.js retries a few times internally with backoff
+// for exactly this case. This handler logs every attempt's error and
+// only gives up (exits) once retries are exhausted — determined by
+// checking whether the server ever successfully starts listening.
 let hasStartedListening = false;
-proxyHandle.server.once("listening", () => {
+dispatcherHandle.server.once("listening", () => {
   hasStartedListening = true;
 });
 
-proxyHandle.server.on("error", (err) => {
-  logToFile(`proxy server error (port ${PORT})`, err);
+dispatcherHandle.server.on("error", (err) => {
+  logToFile(`dispatcher error (port ${PORT})`, err);
   if (err.code === "EADDRINUSE") {
-    console.error(`[host.js] port ${PORT} in use, proxy-server.js will retry automatically.`);
-    // Give proxy-server.js's internal retry loop a chance; only exit if,
+    console.error(`[host.js] port ${PORT} in use, core/dispatcher.js will retry automatically.`);
+    // Give the dispatcher's internal retry loop a chance; only exit if,
     // after a generous window, we still never reached "listening".
     setTimeout(() => {
       if (!hasStartedListening) {
-        logToFile(`proxy server error (port ${PORT})`, new Error("Exhausted retries, giving up."));
+        logToFile(`dispatcher error (port ${PORT})`, new Error("Exhausted retries, giving up."));
         console.error(`[host.js] giving up on port ${PORT} after retries exhausted.`);
         process.exit(1);
       }
@@ -163,7 +168,7 @@ proxyHandle.server.on("error", (err) => {
   process.exit(1);
 });
 
-const { handleExtensionResponse } = proxyHandle;
+const { handleExtensionResponse } = dispatcherHandle;
 
 console.error("[host.js] native messaging host started, waiting for messages...");
 
