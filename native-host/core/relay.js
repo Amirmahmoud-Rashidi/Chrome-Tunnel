@@ -15,7 +15,7 @@
 
 const crypto = require("crypto");
 
-const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 60000;
 
 /**
  * @param {(job: object) => void} sendToExtension - forwards a job
