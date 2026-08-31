@@ -1,53 +1,120 @@
-// core/relay.js — the one piece every protocol handler shares: turning a
-// {url, method, headers, body} job into a promise that resolves with the
-// extension's fetch() result (or rejects on error/timeout).
+// core/relay.js — shared native-message request/response relay.
 //
-// This is intentionally the ONLY thing that knows about the
-// native-messaging request/response id map. It doesn't know or care
-// whether the caller is the plain-HTTP handler, the HTTPS/MITM handler,
-// or (later) a WebSocket or other protocol handler — every one of them
-// just needs "send this job to the extension, get a response back",
-// which is exactly what relayToExtension() provides.
+// Long responses are streamed as a sequence of messages:
+//   { id, stream: "start", status, statusText, headers }
+//   { id, stream: "data", body }          // body is base64
+//   { id, stream: "end" }
+//   { id, stream: "error", error }
 //
-// Splitting this out of proxy-server.js is what lets protocol handlers
-// live in their own files/folders under protocols/ without each one
-// re-implementing its own id map and timeout logic.
-
+// The 60s timeout is an INACTIVITY timeout, not a maximum request lifetime.
+// Every stream message resets it, so a response may continue indefinitely as
+// long as progress is still being made.
 const crypto = require("crypto");
 
-const DEFAULT_TIMEOUT_MS = 60000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 
-/**
- * @param {(job: object) => void} sendToExtension - forwards a job
- *        {id, url, method, headers, body?} to the extension via native
- *        messaging.
- * @returns {{
- *   relayToExtension: (req: {url: string, method: string, headers: object, bodyBuffer?: Buffer}) => Promise<object>,
- *   handleExtensionResponse: (message: object) => void,
- * }}
- */
 function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
-  // Map of request id -> { resolve, reject } for in-flight requests.
-  // Shared across every protocol handler that calls relayToExtension().
   const pending = new Map();
+
+  function clearEntry(id) {
+    const entry = pending.get(id);
+    if (!entry) return null;
+    if (entry.timer) clearTimeout(entry.timer);
+    pending.delete(id);
+    return entry;
+  }
+
+  function armInactivityTimer(id, entry) {
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      const err = new Error(
+        `Timed out waiting for extension activity (${timeoutMs}ms without progress).`
+      );
+      err.code = "EXTENSION_INACTIVITY_TIMEOUT";
+      entry.reject(err);
+    }, timeoutMs);
+  }
+
+  function failEntry(id, entry, err) {
+    if (entry.timer) clearTimeout(entry.timer);
+    pending.delete(id);
+    entry.reject(err instanceof Error ? err : new Error(String(err)));
+  }
+
+  function callStreamHandler(id, entry, handler, arg) {
+    if (typeof handler !== "function") return true;
+    try {
+      handler(arg);
+      return true;
+    } catch (err) {
+      failEntry(id, entry, err);
+      return false;
+    }
+  }
 
   function handleExtensionResponse(message) {
     const { id } = message || {};
     if (!id || !pending.has(id)) {
-      // Could be a stray/duplicate message, or a ping reply — ignore safely.
+      // Stray/duplicate response or ping reply.
       return;
     }
-    const { resolve } = pending.get(id);
-    pending.delete(id);
-    resolve(message);
+
+    const entry = pending.get(id);
+
+    // Streaming protocol. Any stream event counts as activity and refreshes
+    // the native-side inactivity deadline.
+    if (message.stream === "start") {
+      armInactivityTimer(id, entry);
+      callStreamHandler(id, entry, entry.onResponseStart, message);
+      return;
+    }
+
+    if (message.stream === "data") {
+      armInactivityTimer(id, entry);
+      const chunk = message.body
+        ? Buffer.from(message.body, "base64")
+        : Buffer.alloc(0);
+      callStreamHandler(id, entry, entry.onResponseChunk, chunk);
+      return;
+    }
+
+    if (message.stream === "end") {
+      if (entry.timer) clearTimeout(entry.timer);
+      pending.delete(id);
+      try {
+        if (typeof entry.onResponseEnd === "function") {
+          entry.onResponseEnd();
+        }
+        entry.resolve({ id, streamed: true });
+      } catch (err) {
+        entry.reject(err);
+      }
+      return;
+    }
+
+    if (message.stream === "error") {
+      const err = new Error(message.error || "Extension stream failed.");
+      err.code = "EXTENSION_STREAM_ERROR";
+      failEntry(id, entry, err);
+      return;
+    }
+
+    // Backward compatibility with the original single-message response.
+    const finished = clearEntry(id);
+    if (finished) finished.resolve(message);
   }
 
-  /**
-   * Sends {method, url, headers, body} to the extension and resolves with
-   * the extension's {status, statusText, headers, body} or rejects on
-   * error/timeout.
-   */
-  function relayToExtension({ url, method, headers, bodyBuffer }) {
+  function relayToExtension({
+    url,
+    method,
+    headers,
+    bodyBuffer,
+    onResponseStart,
+    onResponseChunk,
+    onResponseEnd,
+  }) {
     const id = crypto.randomUUID();
     const forwardHeaders = { ...headers };
     delete forwardHeaders["proxy-connection"];
@@ -61,16 +128,25 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
     }
 
     const responsePromise = new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      setTimeout(() => {
-        if (pending.has(id)) {
-          pending.delete(id);
-          reject(new Error("Timed out waiting for extension response."));
-        }
-      }, timeoutMs);
+      const entry = {
+        resolve,
+        reject,
+        timer: null,
+        onResponseStart,
+        onResponseChunk,
+        onResponseEnd,
+      };
+      pending.set(id, entry);
+      armInactivityTimer(id, entry);
     });
 
-    sendToExtension(job);
+    try {
+      sendToExtension(job);
+    } catch (err) {
+      const entry = clearEntry(id);
+      if (entry) entry.reject(err);
+    }
+
     return responsePromise;
   }
 
