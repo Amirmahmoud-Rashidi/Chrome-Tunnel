@@ -6,12 +6,15 @@
 //   { id, stream: "end" }
 //   { id, stream: "error", error }
 //
-// The 60s timeout is an INACTIVITY timeout, not a maximum request lifetime.
-// Every stream message resets it, so a response may continue indefinitely as
-// long as progress is still being made.
+// The extension owns normal/stream timeout policy. Its queue/fetch phase
+// messages and body messages announce the next deadline. This watchdog waits
+// that long plus delivery grace; it must not cut a slow stream off at 60s.
+// Without timing metadata (older extensions), keep the original 60s fallback.
 const crypto = require("crypto");
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DELIVERY_GRACE_MS = 15_000;
+const MAX_EXTENSION_TIMEOUT_MS = 300_000;
 
 function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   const pending = new Map();
@@ -24,17 +27,25 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
     return entry;
   }
 
-  function armInactivityTimer(id, entry) {
+  function announcedTimeout(message) {
+    const ms = message.timeoutMs;
+    return Number.isInteger(ms) && ms > 0 && ms <= MAX_EXTENSION_TIMEOUT_MS
+      ? ms + DELIVERY_GRACE_MS
+      : timeoutMs;
+  }
+
+  function armInactivityTimer(id, entry, waitMs = timeoutMs) {
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = setTimeout(() => {
       if (!pending.has(id)) return;
       pending.delete(id);
       const err = new Error(
-        `Timed out waiting for extension activity (${timeoutMs}ms without progress).`
+        `Timed out waiting for extension activity (${waitMs}ms without progress; ` +
+          `phase=${entry.phase}; type=${entry.requestType || "unknown"}).`
       );
       err.code = "EXTENSION_INACTIVITY_TIMEOUT";
       entry.reject(err);
-    }, timeoutMs);
+    }, waitMs);
   }
 
   function failEntry(id, entry, err) {
@@ -63,19 +74,41 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
 
     const entry = pending.get(id);
 
-    // Streaming protocol. Any stream event counts as activity and refreshes
-    // the native-side inactivity deadline.
+    // These are control messages, not completed HTTP responses. Only genuine
+    // forward phase transitions refresh the timer; duplicate announcements
+    // must not postpone a deadline indefinitely.
+    if (message.progress) {
+      if (message.progress === "queued" && entry.phase === "bridge") {
+        entry.phase = "queue";
+      } else if (
+        message.progress === "fetching" &&
+        (entry.phase === "bridge" || entry.phase === "queue")
+      ) {
+        entry.phase = "headers";
+      } else {
+        return;
+      }
+      entry.requestType = message.requestType;
+      armInactivityTimer(id, entry, announcedTimeout(message));
+      return;
+    }
+
     if (message.stream === "start") {
-      armInactivityTimer(id, entry);
+      if (entry.phase === "first-chunk" || entry.phase === "body") return;
+      entry.phase = "first-chunk";
+      entry.requestType = message.requestType || entry.requestType;
+      armInactivityTimer(id, entry, announcedTimeout(message));
       callStreamHandler(id, entry, entry.onResponseStart, message);
       return;
     }
 
     if (message.stream === "data") {
-      armInactivityTimer(id, entry);
       const chunk = message.body
         ? Buffer.from(message.body, "base64")
         : Buffer.alloc(0);
+      if (chunk.length === 0) return;
+      entry.phase = "body";
+      armInactivityTimer(id, entry, announcedTimeout(message));
       callStreamHandler(id, entry, entry.onResponseChunk, chunk);
       return;
     }
@@ -132,6 +165,8 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
         resolve,
         reject,
         timer: null,
+        phase: "bridge",
+        requestType: null,
         onResponseStart,
         onResponseChunk,
         onResponseEnd,
