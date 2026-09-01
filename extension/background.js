@@ -6,9 +6,9 @@
 //   { id, stream: "end" }
 //   { id, stream: "error", error }
 //
-// REQUEST_TIMEOUT_MS is deliberately an inactivity/startup deadline, NOT a
-// maximum lifetime for the entire response. A response may run for minutes as
-// long as new data keeps arriving before the inactivity deadline expires.
+// Ordinary requests and application streams have separate timeout policies.
+// Queue time is independent. There is no total response lifetime limit: after
+// the first body chunk, only a lack of new data can expire the body timer.
 
 const NATIVE_HOST_NAME = "local.chrometunnel.host";
 const SESSION_KEY_CONNECTED = "chrometunnel_connected";
@@ -18,10 +18,58 @@ const SESSION_KEY_CONNECTED = "chrometunnel_connected";
 const CHUNK_THRESHOLD_BYTES = 800 * 1024;
 const CHUNK_SIZE_BYTES = 700 * 1024;
 
-// 45 seconds remains the extension-side safety value, but now means:
-//   1) maximum queue + response-header wait before fetch starts/responds, and
-//   2) maximum period with NO response-body progress after headers arrive.
-const REQUEST_TIMEOUT_MS = 45_000;
+const QUEUE_TIMEOUT_MS = 45_000;
+const REQUEST_TIMEOUTS = Object.freeze({
+  normal: Object.freeze({ headersMs: 45_000, firstChunkMs: 45_000, idleMs: 45_000 }),
+  stream: Object.freeze({ headersMs: 180_000, firstChunkMs: 180_000, idleMs: 90_000 }),
+});
+
+function getHeader(headers, name) {
+  const entry = Object.entries(headers || {}).find(
+    ([key]) => key.toLowerCase() === name
+  );
+  return entry ? String(entry[1]) : "";
+}
+
+function isStreamingContentType(value) {
+  const type = String(value || "").split(";", 1)[0].trim().toLowerCase();
+  return ["text/event-stream", "application/x-ndjson", "application/json-seq"].includes(type);
+}
+
+// Detect intent BEFORE fetch(), because response Content-Type arrives too late
+// to choose the response-header deadline. Do not classify every chunked HTTP
+// transfer (downloads, JSON, etc.) as an application stream.
+function getRequestType({ url, headers, body }) {
+  const acceptsStream = getHeader(headers, "accept").split(",").some((value) => {
+    const excluded = /;\s*q\s*=\s*0(?:\.0*)?\s*(?:;|$)/i.test(value);
+    return !excluded && isStreamingContentType(value);
+  });
+  if (acceptsStream) return "stream";
+
+  try {
+    const target = new URL(url);
+    if (
+      target.searchParams.get("alt")?.toLowerCase() === "sse" ||
+      /^(true|1)$/i.test(target.searchParams.get("stream") || "") ||
+      /:streamGenerateContent$/i.test(target.pathname)
+    ) {
+      return "stream";
+    }
+  } catch {
+    // fetch() reports malformed URLs through the normal error path.
+  }
+
+  const contentType = getHeader(headers, "content-type").split(";", 1)[0].trim().toLowerCase();
+  if (body && (!contentType || contentType === "application/json" || contentType.endsWith("+json"))) {
+    try {
+      const payload = JSON.parse(new TextDecoder().decode(base64ToUint8Array(body)));
+      if (payload && payload.stream === true) return "stream";
+    } catch {
+      // Classification must not change, reject, or reserialize the request body.
+    }
+  }
+  return "normal";
+}
 
 let port = null;
 let connectInFlight = false;
@@ -34,16 +82,39 @@ const MAX_CONCURRENT_FETCHES = 6;
 let activeFetchCount = 0;
 const fetchQueue = [];
 
-function runWithConcurrencyLimit(task) {
+function runWithConcurrencyLimit(task, onQueueTimeout) {
+  const entry = { task, timer: null, expiresAt: null, onQueueTimeout };
   if (activeFetchCount < MAX_CONCURRENT_FETCHES) {
+    startFetchTask(entry);
+  } else {
+    entry.expiresAt = Date.now() + QUEUE_TIMEOUT_MS;
+    entry.timer = setTimeout(() => {
+      const index = fetchQueue.indexOf(entry);
+      if (index === -1) return;
+      fetchQueue.splice(index, 1);
+      onQueueTimeout();
+    }, QUEUE_TIMEOUT_MS);
+    fetchQueue.push(entry);
+  }
+}
+
+function startFetchTask(entry) {
+  while (entry) {
+    if (entry.timer) clearTimeout(entry.timer);
+    // A slot can open in the same event-loop turn as the queue timer expires.
+    // Check the absolute deadline before dispatch so an expired POST never runs.
+    if (entry.expiresAt !== null && Date.now() >= entry.expiresAt) {
+      entry.onQueueTimeout();
+      entry = fetchQueue.shift();
+      continue;
+    }
     activeFetchCount++;
-    task().finally(() => {
+    entry.task().finally(() => {
       activeFetchCount--;
       const next = fetchQueue.shift();
-      if (next) runWithConcurrencyLimit(next);
+      if (next) startFetchTask(next);
     });
-  } else {
-    fetchQueue.push(task);
+    return;
   }
 }
 
@@ -154,38 +225,34 @@ async function handleNativeMessage(message) {
   }
 
   const receivedAt = Date.now();
+  let requestType = getRequestType(message);
+
+  // Progress messages carry the active deadline to the native watchdog. They
+  // are sent only on phase changes, not as heartbeats that could hide a stall.
+  sendToNative({ id, progress: "queued", requestType, timeoutMs: QUEUE_TIMEOUT_MS });
 
   runWithConcurrencyLimit(async () => {
-    const elapsedMs = Date.now() - receivedAt;
-    const startupRemainingMs = REQUEST_TIMEOUT_MS - elapsedMs;
-
-    if (startupRemainingMs <= 0) {
-      sendToNative({
-        id,
-        error: `Request timed out while waiting in extension fetch queue (${REQUEST_TIMEOUT_MS}ms deadline).`,
-      });
-      return;
-    }
-
+    const fetchStartedAt = Date.now();
+    const queueMs = fetchStartedAt - receivedAt;
+    let policy = REQUEST_TIMEOUTS[requestType];
+    let headersMs = null;
     const controller = new AbortController();
     let timeoutHandle = null;
+    let timeoutMs = policy.headersMs;
     let timeoutPhase = "waiting for response headers";
     let streamStarted = false;
 
     function armTimeout(ms, phase) {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      timeoutMs = ms;
       timeoutPhase = phase;
       timeoutHandle = setTimeout(() => controller.abort(), ms);
     }
 
-    function resetBodyInactivityTimeout() {
-      armTimeout(
-        REQUEST_TIMEOUT_MS,
-        `waiting for next response chunk (${REQUEST_TIMEOUT_MS}ms inactivity limit)`
-      );
-    }
-
-    armTimeout(startupRemainingMs, "waiting for response headers");
+    armTimeout(policy.headersMs, "waiting for response headers");
+    sendToNative({
+      id, progress: "fetching", requestType, timeoutMs: policy.headersMs, queueMs,
+    });
 
     try {
       const fetchOptions = {
@@ -196,15 +263,26 @@ async function handleNativeMessage(message) {
 
       if (body) fetchOptions.body = base64ToUint8Array(body);
 
-      // fetch() resolves when response headers are available. From this point
-      // onward we switch from a total deadline to an inactivity deadline.
+      // The response-header budget starts when this fetch starts, so time in
+      // the queue cannot consume the stream's larger startup allowance.
       const response = await fetch(url, fetchOptions);
+      headersMs = Date.now() - fetchStartedAt;
 
       const responseHeaders = {};
       for (const [key, value] of response.headers.entries()) {
         responseHeaders[key] = value;
       }
 
+      // Servers may reveal a stream only in their response. This upgrades body
+      // timeouts; only request-side hints can extend the earlier header wait.
+      if (isStreamingContentType(getHeader(responseHeaders, "content-type"))) {
+        requestType = "stream";
+        policy = REQUEST_TIMEOUTS.stream;
+      }
+
+      // Headers can arrive before the model generates its first output. Give
+      // that first body chunk its own startup allowance, then use idleMs.
+      armTimeout(policy.firstChunkMs, "waiting for first response chunk");
       streamStarted = true;
       sendToNative({
         id,
@@ -212,6 +290,10 @@ async function handleNativeMessage(message) {
         status: response.status,
         statusText: response.statusText,
         headers: responseHeaders,
+        requestType,
+        timeoutMs: policy.firstChunkMs,
+        queueMs,
+        headersMs,
       });
 
       // A response with no body (HEAD/204/etc.) is complete immediately.
@@ -222,21 +304,21 @@ async function handleNativeMessage(message) {
       }
 
       const reader = response.body.getReader();
-      resetBodyInactivityTimeout();
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         if (value && value.byteLength > 0) {
+          armTimeout(policy.idleMs, "waiting for next response chunk");
           // Forward each browser response chunk immediately instead of first
           // buffering the entire response into response.arrayBuffer().
           sendToNative({
             id,
             stream: "data",
             body: uint8ArrayToBase64(value),
+            timeoutMs: policy.idleMs,
           });
-          resetBodyInactivityTimeout();
         }
       }
 
@@ -247,11 +329,14 @@ async function handleNativeMessage(message) {
 
       const aborted =
         controller.signal.aborted || (err && err.name === "AbortError");
+      const timing = `type=${requestType}; queueMs=${queueMs}; ` +
+        `headersMs=${headersMs === null ? "pending" : headersMs}; ` +
+        `fetchMs=${Date.now() - fetchStartedAt}`;
       const errorMessage = aborted
-        ? `Extension fetch timed out: ${timeoutPhase}.`
-        : err && err.message
+        ? `Extension fetch timed out: ${timeoutPhase} (limitMs=${timeoutMs}; ${timing}).`
+        : `${err && err.message
           ? err.message
-          : String(err);
+          : String(err)} (${timing})`;
 
       console.error("[chrometunnel] fetch failed for", url, errorMessage);
 
@@ -261,6 +346,12 @@ async function handleNativeMessage(message) {
         sendToNative({ id, error: errorMessage });
       }
     }
+  }, () => {
+    sendToNative({
+      id,
+      error: `Request timed out while waiting in extension fetch queue ` +
+        `(type=${requestType}; limitMs=${QUEUE_TIMEOUT_MS}; queueMs=${Date.now() - receivedAt}).`,
+    });
   });
 }
 
