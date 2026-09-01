@@ -37,6 +37,16 @@ function attach(server, { relayToExtension }) {
 
     if (head && head.length > 0) tlsSocket.unshift(head);
 
+    // Track where this TLS connection was when it failed, so the failure log
+    // can distinguish real problems (handshake never completed — likely a CA
+    // trust issue, the kind that actually breaks clients) from harmless noise
+    // (idle keep-alive sockets the client opened and closed without sending
+    // anything). See PROJECT_HISTORY.md, bug-hunting notes for #14.
+    const tlsState = { phase: "handshake" };
+    tlsSocket.on("secureConnect", () => {
+      tlsState.phase = "idle";
+    });
+
     tlsSocket.on("error", (err) => {
       console.error(`[protocols/https] TLS error for ${hostname}:`, err.message);
       logFailedRequest({
@@ -44,6 +54,7 @@ function attach(server, { relayToExtension }) {
         url: `https://${hostname}`,
         origin: `client:${req.socket.remoteAddress}:${req.socket.remotePort}`,
         reason: err.message,
+        phase: tlsState.phase,
       });
     });
 
@@ -51,7 +62,8 @@ function attach(server, { relayToExtension }) {
       tlsSocket,
       hostname,
       clientSocket,
-      relayToExtension
+      relayToExtension,
+      tlsState
     );
   });
 }
@@ -60,7 +72,8 @@ function handleDecryptedHttpStream(
   tlsSocket,
   hostname,
   clientSocket,
-  relayToExtension
+  relayToExtension,
+  tlsState
 ) {
   let buffer = Buffer.alloc(0);
   const clientOrigin = `${clientSocket.remoteAddress}:${clientSocket.remotePort}`;
@@ -79,6 +92,10 @@ function handleDecryptedHttpStream(
     const requestLine = lines[0];
     const [method, path] = requestLine.split(" ");
     const headers = {};
+
+    // The TLS handshake completed and the client sent a real request. Any
+    // error from this point on is a mid-stream failure, not idle churn.
+    if (tlsState) tlsState.phase = "request";
 
     for (let i = 1; i < lines.length; i++) {
       const idx = lines[i].indexOf(":");
@@ -152,6 +169,7 @@ function handleDecryptedHttpStream(
           url: targetUrl,
           origin: clientOrigin,
           reason: err.message,
+          phase: tlsState.phase,
         });
 
         if (streamState.started) {
@@ -204,6 +222,7 @@ function logHttpStatus(result, context) {
       origin: context.origin,
       status: result.status,
       reason: result.statusText,
+      phase: "request",
     });
   }
 }
@@ -261,6 +280,7 @@ function writeTlsResult(tlsSocket, result, context) {
         id: result.id,
         method: context.method,
         url: context.url,
+        phase: "request",
         origin: context.origin,
         reason: result.error,
       });

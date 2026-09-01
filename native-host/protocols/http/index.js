@@ -28,13 +28,29 @@ function attach(server, { relayToExtension }) {
     }
 
     const chunks = [];
+    // Mirror HTTPS phase tracking so the failure log can tell idle mid-air
+    // disconnects apart from errors that hit after the request reached us.
+    // Plain HTTP has no TLS handshake, so phases here are just "idle"
+    // (request stream not yet complete) and "request" (headers parsed).
+    const httpState = { phase: "idle" };
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("error", (err) => {
       console.error("[protocols/http] request stream error:", err);
+      logFailedRequest({
+        source: "http-request",
+        method: req.method,
+        url: targetUrl,
+        origin: `client:${req.socket.remoteAddress}:${req.socket.remotePort}`,
+        reason: err.message,
+        phase: httpState.phase,
+      });
     });
 
     req.on("end", async () => {
       const bodyBuffer = Buffer.concat(chunks);
+      // The request line and headers were already parsed by the time we get
+      // here, so any subsequent error is mid-response, not idle churn.
+      httpState.phase = "request";
       const clientOrigin = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
       const context = {
         method: req.method,
@@ -77,6 +93,7 @@ function attach(server, { relayToExtension }) {
           url: targetUrl,
           origin: clientOrigin,
           reason: err.message,
+          phase: httpState.phase,
         });
 
         if (!res.headersSent) {
@@ -113,6 +130,7 @@ function logHttpStatus(result, context) {
       origin: context.origin,
       status: result.status,
       reason: result.statusText,
+      phase: "request",
     });
   }
 }
@@ -138,6 +156,7 @@ function writeHttpResult(res, result, context) {
       url: context.url,
       origin: context.origin,
       reason: result.error,
+      phase: "request",
     });
     res.writeHead(502, { "Content-Type": "text/plain" });
     res.end(`Extension fetch failed: ${result.error}\n`);

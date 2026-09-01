@@ -50,6 +50,7 @@ function logFailedRequest(entry) {
   if (entry.url) parts.push(`url=${entry.url}`);
   if (entry.origin) parts.push(`from=${entry.origin}`);
   if (entry.status !== undefined) parts.push(`status=${entry.status}`);
+  if (entry.phase) parts.push(`phase=${entry.phase}`);
   if (entry.reason) parts.push(`reason=${JSON.stringify(entry.reason)}`);
 
   const line = parts.join(" ") + "\n";
