@@ -79,8 +79,21 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
 
   function handleExtensionResponse(message) {
     const { id } = message || {};
-    if (!id || !pending.has(id)) {
+    if (!id || (!pending.has(id) && !wsSessions.has(id))) {
       // Stray/duplicate response or ping reply.
+      return;
+    }
+
+    // WebSocket control messages live in wsSessions, not pending — route
+    // them there before falling into the HTTP pending-entry lookup below.
+    if (
+      wsSessions.has(id) &&
+      (message.wsAccepted !== undefined ||
+        message.wsError !== undefined ||
+        message.wsMessage !== undefined ||
+        message.wsClose !== undefined)
+    ) {
+      handleWsControlMessage(id, message);
       return;
     }
 
@@ -143,76 +156,6 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
       const err = new Error(message.error || "Extension stream failed.");
       err.code = "EXTENSION_STREAM_ERROR";
       failEntry(id, entry, err);
-      return;
-    }
-
-    // ---- WebSocket control plane --------------------------------------
-    //
-    // A live WebSocket session sends three kinds of control messages:
-    //   { id, wsAccepted, headers }  — handshake succeeded upstream
-    //   { id, wsError }              — handshake failed
-    //   { id, wsMessage, isBinary }  — frame from upstream server
-    //   { id, wsClose, code, reason }— upstream server closed
-    //
-    // These are interleaved with the HTTP request map but use a
-    // separate id-space (uuid), so the only overlap is when a normal
-    // HTTP request happens to have the same uuid — vanishingly unlikely
-    // and harmless if it does (the wsSession branch simply misses).
-
-    if (message.wsAccepted !== undefined || message.wsError !== undefined) {
-      const session = wsSessions.get(id);
-      if (!session) return;
-      if (session.handshakeDone) return;
-      session.handshakeDone = true;
-      if (session.handshakeTimer) {
-        clearTimeout(session.handshakeTimer);
-        session.handshakeTimer = null;
-      }
-      if (message.wsError) {
-        session.resolve({ error: String(message.wsError) });
-        wsSessions.delete(id);
-      } else {
-        session.resolve({ accepted: true, headers: message.headers || {} });
-      }
-      return;
-    }
-
-    if (message.wsMessage !== undefined) {
-      const session = wsSessions.get(id);
-      if (!session) return;
-      armWsIdleTimer(id, session);
-      for (const listener of wsInboundListeners) {
-        try {
-          listener({
-            kind: "message",
-            id,
-            payload: message.wsMessage, // base64
-            isBinary: Boolean(message.isBinary),
-          });
-        } catch (err) {
-          console.error("[relay] ws message listener threw:", err);
-        }
-      }
-      return;
-    }
-
-    if (message.wsClose) {
-      const session = wsSessions.get(id);
-      if (!session) return;
-      clearWsTimers(session);
-      wsSessions.delete(id);
-      for (const listener of wsInboundListeners) {
-        try {
-          listener({
-            kind: "close",
-            id,
-            code: typeof message.wsClose === "object" ? message.wsClose.code : 1000,
-            reason: typeof message.wsClose === "object" ? message.wsClose.reason : "",
-          });
-        } catch (err) {
-          console.error("[relay] ws close listener threw:", err);
-        }
-      }
       return;
     }
 
@@ -289,6 +232,77 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   // Inbound messages (server → client) are dispatched to listeners
   // registered via onWsInbound(). The protocols/ws module wires its
   // client socket writes through this channel.
+
+  // ---- WebSocket control plane --------------------------------------
+  //
+  // A live WebSocket session sends three kinds of control messages, all
+  // routed here by handleExtensionResponse (they live in wsSessions, not
+  // the HTTP pending map):
+  //   { id, wsAccepted, headers }  — handshake succeeded upstream
+  //   { id, wsError }              — handshake failed
+  //   { id, wsMessage, isBinary }  — frame from upstream server
+  //   { id, wsClose, code, reason }— upstream server closed
+  //
+  // These use a separate id-space (uuid) from HTTP pending entries, so
+  // there is no collision risk between the two maps.
+  function handleWsControlMessage(id, message) {
+    if (message.wsAccepted !== undefined || message.wsError !== undefined) {
+      const session = wsSessions.get(id);
+      if (!session) return;
+      if (session.handshakeDone) return;
+      session.handshakeDone = true;
+      if (session.handshakeTimer) {
+        clearTimeout(session.handshakeTimer);
+        session.handshakeTimer = null;
+      }
+      if (message.wsError) {
+        session.resolve({ id, error: String(message.wsError) });
+        wsSessions.delete(id);
+      } else {
+        session.resolve({ id, accepted: true, headers: message.headers || {} });
+      }
+      return;
+    }
+
+    if (message.wsMessage !== undefined) {
+      const session = wsSessions.get(id);
+      if (!session) return;
+      armWsIdleTimer(id, session);
+      for (const listener of wsInboundListeners) {
+        try {
+          listener({
+            kind: "message",
+            id,
+            payload: message.wsMessage, // base64
+            isBinary: Boolean(message.isBinary),
+          });
+        } catch (err) {
+          console.error("[relay] ws message listener threw:", err);
+        }
+      }
+      return;
+    }
+
+    if (message.wsClose) {
+      const session = wsSessions.get(id);
+      if (!session) return;
+      clearWsTimers(session);
+      wsSessions.delete(id);
+      for (const listener of wsInboundListeners) {
+        try {
+          listener({
+            kind: "close",
+            id,
+            code: typeof message.wsClose === "object" ? message.wsClose.code : 1000,
+            reason: typeof message.wsClose === "object" ? message.wsClose.reason : "",
+          });
+        } catch (err) {
+          console.error("[relay] ws close listener threw:", err);
+        }
+      }
+      return;
+    }
+  }
 
   function armWsIdleTimer(id, session) {
     if (session.idleTimer) clearTimeout(session.idleTimer);
