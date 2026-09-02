@@ -16,8 +16,20 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DELIVERY_GRACE_MS = 15_000;
 const MAX_EXTENSION_TIMEOUT_MS = 300_000;
 
+// WebSocket connections are long-lived; the HTTP request/response
+// timeout policy doesn't apply. Idle = no traffic in this many ms
+// (refreshed on every message). Handshake has its own shorter deadline.
+const WS_HANDSHAKE_TIMEOUT_MS = 45_000;
+const WS_IDLE_TIMEOUT_MS = 120_000;
+
 function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   const pending = new Map();
+  // Live WebSocket sessions, keyed by id. Each holds the long-lived
+  // promise resolvers + bookkeeping for the inactivity timer.
+  const wsSessions = new Map();
+  // Callbacks the protocols/ws module registers so it can be told when
+  // the extension sends a server→client message or closes the socket.
+  const wsInboundListeners = new Set();
 
   function clearEntry(id) {
     const entry = pending.get(id);
@@ -134,6 +146,76 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
       return;
     }
 
+    // ---- WebSocket control plane --------------------------------------
+    //
+    // A live WebSocket session sends three kinds of control messages:
+    //   { id, wsAccepted, headers }  — handshake succeeded upstream
+    //   { id, wsError }              — handshake failed
+    //   { id, wsMessage, isBinary }  — frame from upstream server
+    //   { id, wsClose, code, reason }— upstream server closed
+    //
+    // These are interleaved with the HTTP request map but use a
+    // separate id-space (uuid), so the only overlap is when a normal
+    // HTTP request happens to have the same uuid — vanishingly unlikely
+    // and harmless if it does (the wsSession branch simply misses).
+
+    if (message.wsAccepted !== undefined || message.wsError !== undefined) {
+      const session = wsSessions.get(id);
+      if (!session) return;
+      if (session.handshakeDone) return;
+      session.handshakeDone = true;
+      if (session.handshakeTimer) {
+        clearTimeout(session.handshakeTimer);
+        session.handshakeTimer = null;
+      }
+      if (message.wsError) {
+        session.resolve({ error: String(message.wsError) });
+        wsSessions.delete(id);
+      } else {
+        session.resolve({ accepted: true, headers: message.headers || {} });
+      }
+      return;
+    }
+
+    if (message.wsMessage !== undefined) {
+      const session = wsSessions.get(id);
+      if (!session) return;
+      armWsIdleTimer(id, session);
+      for (const listener of wsInboundListeners) {
+        try {
+          listener({
+            kind: "message",
+            id,
+            payload: message.wsMessage, // base64
+            isBinary: Boolean(message.isBinary),
+          });
+        } catch (err) {
+          console.error("[relay] ws message listener threw:", err);
+        }
+      }
+      return;
+    }
+
+    if (message.wsClose) {
+      const session = wsSessions.get(id);
+      if (!session) return;
+      clearWsTimers(session);
+      wsSessions.delete(id);
+      for (const listener of wsInboundListeners) {
+        try {
+          listener({
+            kind: "close",
+            id,
+            code: typeof message.wsClose === "object" ? message.wsClose.code : 1000,
+            reason: typeof message.wsClose === "object" ? message.wsClose.reason : "",
+          });
+        } catch (err) {
+          console.error("[relay] ws close listener threw:", err);
+        }
+      }
+      return;
+    }
+
     // Backward compatibility with the original single-message response.
     const finished = clearEntry(id);
     if (finished) finished.resolve(message);
@@ -185,7 +267,151 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
     return responsePromise;
   }
 
-  return { relayToExtension, handleExtensionResponse };
+  // ---- WebSocket relay API ----------------------------------------------
+  //
+  // Three operations make up the full client→extension→server data path:
+  //
+  //   relayWsOpen({url, headers})
+  //     → Promise<{accepted, headers} | {error}>
+  //     Asks the extension to open a real WebSocket to the upstream.
+  //     Resolves on first wsAccepted / wsError message; any later
+  //     messages with this id are routed to the inbound listeners.
+  //
+  //   relayWsMessage({id, wsSend: {payload, isBinary}})
+  //     Forwards a client frame upstream. Best-effort: the WebSocket
+  //     might already be closed by the time the extension processes it.
+  //
+  //   relayWsControl({id, wsClose: {code, reason}})
+  //     Tells the extension to close the upstream WebSocket cleanly.
+  //     Used when the client side closes first, so the upstream
+  //     observes a WebSocket close (not a TCP reset).
+  //
+  // Inbound messages (server → client) are dispatched to listeners
+  // registered via onWsInbound(). The protocols/ws module wires its
+  // client socket writes through this channel.
+
+  function armWsIdleTimer(id, session) {
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(() => {
+      if (!wsSessions.has(id)) return;
+      wsSessions.delete(id);
+      for (const listener of wsInboundListeners) {
+        try {
+          listener({ kind: "close", id, code: 1001, reason: "Idle timeout" });
+        } catch (err) {
+          console.error("[relay] ws idle listener threw:", err);
+        }
+      }
+    }, WS_IDLE_TIMEOUT_MS);
+  }
+
+  function clearWsTimers(session) {
+    if (session.handshakeTimer) {
+      clearTimeout(session.handshakeTimer);
+      session.handshakeTimer = null;
+    }
+    if (session.idleTimer) {
+      clearTimeout(session.idleTimer);
+      session.idleTimer = null;
+    }
+  }
+
+  function relayWsOpen({ url, headers }) {
+    const id = crypto.randomUUID();
+    const job = {
+      kind: "ws-open",
+      id,
+      url,
+      headers: stripHopByHop(headers || {}),
+    };
+
+    return new Promise((resolve) => {
+      const handshakeTimer = setTimeout(() => {
+        if (!wsSessions.has(id)) return;
+        wsSessions.delete(id);
+        resolve({ error: "WebSocket handshake timed out" });
+      }, WS_HANDSHAKE_TIMEOUT_MS);
+
+      const session = {
+        resolve,
+        handshakeTimer,
+        idleTimer: null,
+        handshakeDone: false,
+      };
+      wsSessions.set(id, session);
+
+      try {
+        sendToExtension(job);
+      } catch (err) {
+        clearWsTimers(session);
+        wsSessions.delete(id);
+        resolve({ error: err.message });
+      }
+    });
+  }
+
+  function relayWsMessage({ id, wsSend }) {
+    if (!wsSessions.has(id)) {
+      return Promise.resolve(false); // already closed
+    }
+    try {
+      sendToExtension({
+        id,
+        wsSend: {
+          payload: wsSend.payload,
+          isBinary: Boolean(wsSend.isBinary),
+          kind: wsSend.kind || "message",
+        },
+      });
+      return Promise.resolve(true);
+    } catch (err) {
+      return Promise.resolve(false);
+    }
+  }
+
+  function relayWsControl({ id, wsClose }) {
+    if (!wsSessions.has(id)) {
+      return Promise.resolve(false);
+    }
+    try {
+      sendToExtension({ id, wsClose });
+      return Promise.resolve(true);
+    } catch (err) {
+      return Promise.resolve(false);
+    }
+  }
+
+  function onWsInbound(listener) {
+    wsInboundListeners.add(listener);
+    return () => wsInboundListeners.delete(listener);
+  }
+
+  return {
+    relayToExtension,
+    relayWsOpen,
+    relayWsMessage,
+    relayWsControl,
+    onWsInbound,
+    handleExtensionResponse,
+  };
+}
+
+function stripHopByHop(headers) {
+  const out = { ...headers };
+  const hop = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+  ]);
+  for (const k of hop) delete out[k.toLowerCase()];
+  return out;
 }
 
 module.exports = { createRelay, DEFAULT_TIMEOUT_MS };

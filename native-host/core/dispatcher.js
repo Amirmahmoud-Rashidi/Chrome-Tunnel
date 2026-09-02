@@ -17,6 +17,7 @@ const http = require("http");
 const { createRelay } = require("./relay");
 const httpProtocol = require("../protocols/http");
 const httpsProtocol = require("../protocols/https");
+const wsProtocol = require("../protocols/ws");
 
 /**
  * @param {object} opts
@@ -26,7 +27,20 @@ const httpsProtocol = require("../protocols/https");
  * @returns {{ server: http.Server, handleExtensionResponse: (msg: object) => void }}
  */
 function createDispatcher({ port, sendToExtension }) {
-  const { relayToExtension, handleExtensionResponse } = createRelay({ sendToExtension });
+  const {
+    relayToExtension,
+    relayWsOpen,
+    relayWsMessage,
+    relayWsControl,
+    onWsInbound,
+    handleExtensionResponse,
+  } = createRelay({ sendToExtension });
+
+  // WebSocket client sockets, keyed by the relay id. protocols/ws
+  // registers itself in this map after a successful 101, so inbound
+  // extension→client frames (and closes) can be routed to the right
+  // socket. protocols/ws reads/writes it via the helpers it exports.
+  const wsClientTargets = new Map();
 
   // The underlying transport is always a plain http.Server: this is what
   // gives us both "regular" request events (absolute-form HTTP) and
@@ -38,6 +52,29 @@ function createDispatcher({ port, sendToExtension }) {
 
   httpProtocol.attach(server, { relayToExtension });
   httpsProtocol.attach(server, { relayToExtension });
+  wsProtocol.attach(server, { relayWsOpen, relayWsMessage, relayWsControl, wsTargets: wsClientTargets });
+
+  // Wire inbound (extension → client) WebSocket traffic to the protocol
+  // module so the right client socket gets the bytes/close.
+  onWsInbound((evt) => {
+    if (evt.kind === "message") {
+      // evt.payload is base64-encoded — decode for the protocol module.
+      const payload = Buffer.from(evt.payload, "base64");
+      wsProtocol.handleExtensionWsMessage(
+        wsClientTargets,
+        evt.id,
+        payload,
+        evt.isBinary
+      );
+    } else if (evt.kind === "close") {
+      wsProtocol.handleExtensionWsClose(
+        wsClientTargets,
+        evt.id,
+        evt.code,
+        evt.reason
+      );
+    }
+  });
 
   // If a previous host.js instance just exited (e.g. after Chrome's
   // service worker died and we detected the broken pipe), Windows/Node

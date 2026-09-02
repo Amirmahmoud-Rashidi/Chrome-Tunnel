@@ -118,6 +118,153 @@ function startFetchTask(entry) {
   }
 }
 
+// ---- WebSocket sessions ----------------------------------------------------
+//
+// One entry per active WebSocket connection. Keyed by the relay id. The
+// session is removed on close (from either side). Inbound messages from
+// the upstream server are forwarded to the native host as
+// { id, wsMessage, isBinary }. Upstream close becomes { id, wsClose }.
+const wsSessions = new Map();
+
+function handleWebSocketOpen(message) {
+  const { id, url, headers = {} } = message;
+
+  if (typeof WebSocket === "undefined") {
+    sendToNative({ id, wsError: "WebSocket API is not available in this context." });
+    return;
+  }
+
+  // The native host has already vetted the URL is wss:// or ws://, but
+  // we double-check here so a malformed message can't trick us.
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    sendToNative({ id, wsError: `Invalid WebSocket URL: ${url}` });
+    return;
+  }
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+    sendToNative({
+      id,
+      wsError: `Refusing to open WebSocket with non-ws(s) protocol: ${parsed.protocol}`,
+    });
+    return;
+  }
+
+  // We allow only ws:// and wss://; the URL host is required.
+  if (!parsed.host) {
+    sendToNative({ id, wsError: "WebSocket URL has no host." });
+    return;
+  }
+
+  // Pass through subprotocols if the client sent one.
+  const subprotocols = headers["sec-websocket-protocol"];
+  let ws;
+  try {
+    if (subprotocols) {
+      // The header is a comma-separated list per RFC 6455. Pass it as
+      // the second arg so the API picks one that the server supports.
+      const list = subprotocols
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      ws = new WebSocket(url, list.length > 0 ? list : undefined);
+    } else {
+      ws = new WebSocket(url);
+    }
+  } catch (err) {
+    sendToNative({
+      id,
+      wsError: `Failed to construct WebSocket: ${err && err.message ? err.message : err}`,
+    });
+    return;
+  }
+
+  // Hold a reference so a CONNECTING WebSocket survives between turns
+  // and so we can call close() on it if the client closed first.
+  const session = { ws, closeOnOpen: null };
+  wsSessions.set(id, session);
+
+  ws.onopen = () => {
+    // Report accepted. The native host writes the 101 to the client and
+    // starts relaying bytes in both directions.
+    //
+    // Note: the browser WebSocket API doesn't expose the response
+    // status code or headers to JS — they are part of the internal
+    // browser pipeline that fetch() also uses. The browser will reject
+    // non-101 handshakes by firing onerror before onopen ever fires,
+    // so the absence of an "error" means a successful 101.
+    sendToNative({ id, wsAccepted: true, headers: {} });
+    if (session.closeOnOpen) {
+      try {
+        ws.close(session.closeOnOpen.code, session.closeOnOpen.reason);
+      } catch (err) {
+        console.error("[chrometunnel] deferred ws close failed for", id, err);
+      }
+      session.closeOnOpen = null;
+    }
+  };
+
+  ws.onmessage = (event) => {
+    if (!wsSessions.has(id)) return;
+    const data = event.data;
+    let payload;
+    let isBinary = false;
+    if (data instanceof ArrayBuffer) {
+      payload = uint8ArrayToBase64(new Uint8Array(data));
+      isBinary = true;
+    } else if (ArrayBuffer.isView(data)) {
+      payload = uint8ArrayToBase64(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      isBinary = true;
+    } else if (typeof Blob !== "undefined" && data instanceof Blob) {
+      // Binary blob — read it and forward as base64.
+      data
+        .arrayBuffer()
+        .then((buf) => {
+          if (!wsSessions.has(id)) return;
+          sendToNative({
+            id,
+            wsMessage: uint8ArrayToBase64(new Uint8Array(buf)),
+            isBinary: true,
+          });
+        })
+        .catch((err) => {
+          console.error("[chrometunnel] ws blob read failed for", id, err);
+        });
+      return;
+    } else {
+      // String message.
+      const text = String(data);
+      payload = btoa(unescape(encodeURIComponent(text))); // UTF-8 safe
+      isBinary = false;
+    }
+    sendToNative({ id, wsMessage: payload, isBinary });
+  };
+
+  ws.onerror = (event) => {
+    // We can't read the actual error reason from the service-worker
+    // side — browsers intentionally hide that. Report a generic
+    // message; details are only visible in the chrome://extensions
+    // service-worker console.
+    const reason =
+      (event && event.message) ||
+      "WebSocket failed to connect (the upstream may be down, the URL may be wrong, or the host is unreachable through the configured proxy).";
+    if (wsSessions.has(id)) {
+      sendToNative({ id, wsError: reason });
+      wsSessions.delete(id);
+    }
+  };
+
+  ws.onclose = (event) => {
+    if (wsSessions.has(id)) {
+      const code = typeof event.code === "number" ? event.code : 1005;
+      const reason = typeof event.reason === "string" ? event.reason : "";
+      sendToNative({ id, wsClose: { code, reason } });
+      wsSessions.delete(id);
+    }
+  };
+}
+
 // ---- Keep-alive -----------------------------------------------------------
 const KEEP_ALIVE_ALARM = "chrometunnel-keep-alive";
 chrome.alarms.create(KEEP_ALIVE_ALARM, { periodInMinutes: 0.4 });
@@ -219,8 +366,78 @@ async function handleNativeMessage(message) {
     return;
   }
 
+  // ---- WebSocket control plane ------------------------------------------
+  //
+  // A live WebSocket session is identified by the relay id. The native
+  // host sends three kinds of follow-up messages for an open session:
+  //   { id, wsSend: { payload, isBinary, kind } }   — client→server frame
+  //   { id, wsClose: { code, reason } }             — client closed
+  //
+  // We route them to the live WebSocket stored in wsSessions[id].
+  if (id && message.wsSend && wsSessions.has(id)) {
+    const session = wsSessions.get(id);
+    const { payload, isBinary, kind } = message.wsSend;
+    const bytes = base64ToUint8Array(payload || "");
+    if (session.ws.readyState === WebSocket.OPEN) {
+      try {
+        if (kind === "ping") {
+          // The client sent us a ping; we've already ponged the client.
+          // Now forward the same payload to the upstream as a ping so
+          // end-to-end liveness checks still work.
+          if (typeof session.ws.ping === "function") {
+            session.ws.ping(bytes);
+          } else {
+            // Fallback: use a control frame (0x9) if the platform
+            // doesn't expose ws.ping. Most do, but be defensive.
+            session.ws.send(bytes);
+          }
+        } else {
+          session.ws.send(isBinary ? bytes : new TextDecoder().decode(bytes));
+        }
+      } catch (err) {
+        console.error("[chrometunnel] ws send failed for", id, err);
+      }
+    }
+    return;
+  }
+
+  if (id && message.wsClose && wsSessions.has(id)) {
+    const session = wsSessions.get(id);
+    const { code, reason } = message.wsClose || {};
+    try {
+      if (session.ws.readyState === WebSocket.OPEN) {
+        session.ws.close(
+          typeof code === "number" ? code : 1000,
+          typeof reason === "string" ? reason : ""
+        );
+      } else if (session.ws.readyState === WebSocket.CONNECTING) {
+        // Will be closed by the ws.onopen / ws.onerror path. We can
+        // remember the intent and apply on open.
+        session.closeOnOpen = {
+          code: typeof code === "number" ? code : 1000,
+          reason: typeof reason === "string" ? reason : "",
+        };
+      }
+    } catch (err) {
+      console.error("[chrometunnel] ws close failed for", id, err);
+    }
+    return;
+  }
+
   if (!url) {
     sendToNative({ id, error: "Missing 'url' in request message." });
+    return;
+  }
+
+  // ---- WebSocket handshake ---------------------------------------------
+  //
+  // The native host has seen a client HTTP Upgrade: websocket. It asks
+  // us to open a real WebSocket to the upstream server (which is the
+  // only path that will pick up the user's VPN/proxy extension in
+  // Chrome). The handshake response code + headers we observe are
+  // forwarded back to the host, which writes the 101 to the client.
+  if (message.kind === "ws-open") {
+    handleWebSocketOpen(message);
     return;
   }
 
