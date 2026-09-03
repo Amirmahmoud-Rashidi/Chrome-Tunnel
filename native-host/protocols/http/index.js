@@ -1,9 +1,9 @@
 // protocols/http/index.js — absolute-form plain HTTP requests.
 const { logFailedRequest } = require("../../failure-logger");
 const {
-  isMarketplaceCorsPreflight,
+  isCorsPreflight,
   buildCorsPreflightHeaders,
-  applyMarketplaceCorsResponseHeaders,
+  applyCorsResponseHeaders,
 } = require("../../core/cors");
 
 function attach(server, { relayToExtension }) {
@@ -20,7 +20,7 @@ function attach(server, { relayToExtension }) {
       return;
     }
 
-    if (isMarketplaceCorsPreflight(targetUrl, req.method, req.headers)) {
+    if (isCorsPreflight(targetUrl, req.method, req.headers)) {
       req.resume();
       res.writeHead(204, buildCorsPreflightHeaders(req.headers));
       res.end();
@@ -116,7 +116,7 @@ function sanitizeStreamHeaders(headers, context) {
   delete headersToSend["content-encoding"]; // browser fetch already decoded it
   delete headersToSend["transfer-encoding"];
   delete headersToSend["connection"];
-  applyMarketplaceCorsResponseHeaders(headersToSend, context);
+  applyCorsResponseHeaders(headersToSend, context);
   return headersToSend;
 }
 
