@@ -3,9 +3,9 @@ const tls = require("tls");
 const { getCertificateForHost } = require("./tls-mitm");
 const { logFailedRequest } = require("../../failure-logger");
 const {
-  isMarketplaceCorsPreflight,
+  isCorsPreflight,
   buildCorsPreflightHeaders,
-  applyMarketplaceCorsResponseHeaders,
+  applyCorsResponseHeaders,
 } = require("../../core/cors");
 
 function attach(server, { relayToExtension }) {
@@ -122,7 +122,7 @@ function handleDecryptedHttpStream(
       requestHeaders: headers,
     };
 
-    if (isMarketplaceCorsPreflight(targetUrl, method, headers)) {
+    if (isCorsPreflight(targetUrl, method, headers)) {
       const responseHeaders = buildCorsPreflightHeaders(headers);
       responseHeaders["connection"] = "close";
       const headerLines = Object.entries(responseHeaders)
@@ -208,7 +208,7 @@ function sanitizeHeaders(headers, context) {
   delete result["content-encoding"]; // browser fetch already decoded it
   delete result["transfer-encoding"];
   delete result["connection"];
-  applyMarketplaceCorsResponseHeaders(result, context);
+  applyCorsResponseHeaders(result, context);
   return result;
 }
 
