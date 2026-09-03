@@ -1,34 +1,44 @@
-// core/cors.js — CORS preflight short-circuit for VS Code's Marketplace
-// client, shared by the plain-HTTP and HTTPS/MITM protocol handlers.
+// core/cors.js — CORS preflight short-circuit, shared by the plain-HTTP
+// and HTTPS/MITM protocol handlers.
 //
-// Background: Marketplace's browser-side client issues an OPTIONS
-// preflight before its real GET/POST. The Marketplace endpoint itself
-// returns 404 for bare OPTIONS (it doesn't implement CORS preflight
-// handling the way a browser expects), so we answer preflights locally
-// instead of relaying them through the full MITM -> native-messaging ->
-// fetch() -> DotVPN pipeline. See PROJECT_HISTORY.md bug #14.
+// Background: VS Code's Marketplace client (and, it turns out, related
+// asset hosts it talks to — see below) issues an OPTIONS preflight
+// before its real GET/POST. These endpoints return 404/400 for a bare
+// OPTIONS (they don't implement CORS preflight handling the way a
+// browser expects), so we answer preflights locally instead of relaying
+// them through the full MITM -> native-messaging -> fetch() -> DotVPN
+// pipeline. See PROJECT_HISTORY.md bug #14.
+//
+// This was originally hardcoded to exactly "marketplace.visualstudio.com",
+// but Marketplace's real asset downloads (extension icons, manifests,
+// VSIX packages) come from separate per-publisher hosts like
+// "<publisher>.gallerycdn.vsassets.io" and "<publisher>.gallery.vsassets.io"
+// — those were still failing with the same OPTIONS/400/404 pattern
+// because they didn't match the single hardcoded hostname. Rather than
+// hardcode every such host individually (more will likely surface over
+// time), this now recognizes ANY request carrying the actual CORS
+// preflight signature: method=OPTIONS plus both the `Origin` and
+// `Access-Control-Request-Method` headers. That combination is not
+// something a normal GET/POST client sends — only a browser's own CORS
+// preflight machinery produces it — so treating it as "answer locally"
+// regardless of hostname is safe and doesn't risk misclassifying a real
+// request.
 //
 // This lives in core/ (not inside protocols/http or protocols/https)
 // because both protocol handlers need the identical logic — duplicating
 // it per-protocol would risk the two copies drifting apart.
 
-const MARKETPLACE_HOSTNAME = "marketplace.visualstudio.com";
-
-function isMarketplaceUrl(url) {
+function isCorsPreflight(url, method, headers) {
+  if (String(method || "").toUpperCase() !== "OPTIONS") return false;
+  if (!headers || !headers["origin"]) return false;
+  if (!headers["access-control-request-method"]) return false;
   try {
-    return new URL(url).hostname.toLowerCase() === MARKETPLACE_HOSTNAME;
+    // eslint-disable-next-line no-new
+    new URL(url); // just validate the URL is well-formed; hostname no longer matters
+    return true;
   } catch {
     return false;
   }
-}
-
-function isMarketplaceCorsPreflight(url, method, headers) {
-  return (
-    isMarketplaceUrl(url) &&
-    String(method || "").toUpperCase() === "OPTIONS" &&
-    Boolean(headers && headers["origin"]) &&
-    Boolean(headers && headers["access-control-request-method"])
-  );
 }
 
 function buildCorsPreflightHeaders(requestHeaders) {
@@ -48,9 +58,7 @@ function buildCorsPreflightHeaders(requestHeaders) {
   return responseHeaders;
 }
 
-function applyMarketplaceCorsResponseHeaders(responseHeaders, context) {
-  if (!isMarketplaceUrl(context.url)) return;
-
+function applyCorsResponseHeaders(responseHeaders, context) {
   const requestOrigin = context.requestHeaders && context.requestHeaders["origin"];
   if (!requestOrigin) return;
 
@@ -66,8 +74,7 @@ function applyMarketplaceCorsResponseHeaders(responseHeaders, context) {
 }
 
 module.exports = {
-  isMarketplaceUrl,
-  isMarketplaceCorsPreflight,
+  isCorsPreflight,
   buildCorsPreflightHeaders,
-  applyMarketplaceCorsResponseHeaders,
+  applyCorsResponseHeaders,
 };
