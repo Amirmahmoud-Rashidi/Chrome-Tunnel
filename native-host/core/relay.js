@@ -343,7 +343,7 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
       const handshakeTimer = setTimeout(() => {
         if (!wsSessions.has(id)) return;
         wsSessions.delete(id);
-        resolve({ error: "WebSocket handshake timed out" });
+        resolve({ id, error: "WebSocket handshake timed out" });
       }, WS_HANDSHAKE_TIMEOUT_MS);
 
       const session = {
@@ -359,7 +359,7 @@ function createRelay({ sendToExtension, timeoutMs = DEFAULT_TIMEOUT_MS }) {
       } catch (err) {
         clearWsTimers(session);
         wsSessions.delete(id);
-        resolve({ error: err.message });
+        resolve({ id, error: err.message });
       }
     });
   }
