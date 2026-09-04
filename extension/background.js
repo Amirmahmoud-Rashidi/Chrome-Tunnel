@@ -77,6 +77,7 @@ let connectInFlight = false;
 const pendingResponses = [];
 const MAX_PENDING_RESPONSES = 200;
 const incomingChunkBuffers = new Map();
+const MAX_INCOMPLETE_CHUNK_BUFFERS = 50;
 
 const MAX_CONCURRENT_FETCHES = 6;
 let activeFetchCount = 0;
@@ -336,6 +337,15 @@ async function handleNativeMessage(message) {
     const { chunkId, seq, total, data } = message;
     let buf = incomingChunkBuffers.get(chunkId);
     if (!buf) {
+      // Defensive cap: bound worst-case memory growth if some chunkId's
+      // transfer never completes (a bug, host.js restarting mid-send).
+      if (incomingChunkBuffers.size >= MAX_INCOMPLETE_CHUNK_BUFFERS) {
+        const oldestKey = incomingChunkBuffers.keys().next().value;
+        incomingChunkBuffers.delete(oldestKey);
+        console.error(
+          `[chrometunnel] too many incomplete reassembly buffers, dropping oldest (${oldestKey}) to make room for ${chunkId}`
+        );
+      }
       buf = new Array(total).fill(null);
       incomingChunkBuffers.set(chunkId, buf);
     }
@@ -382,15 +392,14 @@ async function handleNativeMessage(message) {
       try {
         if (kind === "ping") {
           // The client sent us a ping; we've already ponged the client.
-          // Now forward the same payload to the upstream as a ping so
-          // end-to-end liveness checks still work.
-          if (typeof session.ws.ping === "function") {
-            session.ws.ping(bytes);
-          } else {
-            // Fallback: use a control frame (0x9) if the platform
-            // doesn't expose ws.ping. Most do, but be defensive.
-            session.ws.send(bytes);
-          }
+          // Forward the same payload to the upstream as a regular
+          // message so end-to-end liveness is still observable there.
+          // Note: the standard WebSocket API (used here, in a Chrome
+          // service worker) has no way to send a true RFC 6455 ping
+          // frame — that control-frame access only exists in Node's
+          // server-side 'ws' library, not in browser/service-worker
+          // WebSocket — so a regular send() is the only option here.
+          session.ws.send(bytes);
         } else {
           session.ws.send(isBinary ? bytes : new TextDecoder().decode(bytes));
         }
