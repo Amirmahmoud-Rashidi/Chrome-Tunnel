@@ -49,6 +49,11 @@ function sendChunked(send, message, chunkIdPrefix = "host") {
  */
 function createChunkReassembler() {
   const buffers = new Map();
+  // Defensive cap: if chunks for some chunkId never complete (a bug, a
+  // dropped connection mid-transfer, etc), the buffer for it stays in
+  // this Map forever. Capping the number of concurrent in-progress
+  // reassemblies bounds worst-case memory growth from that scenario.
+  const MAX_INCOMPLETE_BUFFERS = 50;
 
   function handle(message) {
     if (!message || !message.chunkId) {
@@ -58,6 +63,13 @@ function createChunkReassembler() {
     const { chunkId, seq, total, data } = message;
     let buf = buffers.get(chunkId);
     if (!buf) {
+      if (buffers.size >= MAX_INCOMPLETE_BUFFERS) {
+        const oldestKey = buffers.keys().next().value;
+        buffers.delete(oldestKey);
+        console.error(
+          `[chunking] too many incomplete reassembly buffers, dropping oldest (${oldestKey}) to make room for ${chunkId}`
+        );
+      }
       buf = new Array(total).fill(null);
       buffers.set(chunkId, buf);
     }
