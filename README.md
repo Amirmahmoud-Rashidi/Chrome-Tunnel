@@ -1,6 +1,6 @@
 # chrometunnel
 (Please read the README carefully and completely)  
-Routes HTTP/HTTPS traffic from CLI tools (git, npm, pip) and other apps
+Routes HTTP/HTTPS/Websocket traffic from CLI tools (git, npm, pip) and other apps
 (like VS Code) through Chrome's own network stack — so it passes through
 whatever proxy extension (a VPN extension, etc.) Chrome is configured to
 use, without needing a system-wide VPN or a separate proxy config.
@@ -12,7 +12,7 @@ A Chrome extension can only control Chrome's own traffic
 proxy/VPN browser extensions only tunnel traffic that goes through
 Chrome itself.
 
-chrometunnel bridges that gap for plain HTTP/HTTPS traffic (not raw
+chrometunnel bridges that gap for plain HTTP/HTTPS/Websocket traffic (not raw
 TCP/UDP — no games, VoIP, etc.) using three pieces:
 
 ```
@@ -96,7 +96,7 @@ $env:REQUESTS_CA_BUNDLE = "C:\path\to\native-host\ca\ca-cert.pem"
 
 ## Known limitations
 
-- Only plain request/response HTTP(S) works — no WebSockets, no raw
+- Only plain request/response HTTP(S) and Websocket work — no raw
   TCP protocols (e.g. SSH-based git remotes).
 - Not every VS Code extension respects `http.proxy` — it depends on
   whether the extension author wired their networking through VS
@@ -111,11 +111,12 @@ $env:REQUESTS_CA_BUNDLE = "C:\path\to\native-host\ca\ca-cert.pem"
 - Depends on Chrome staying open with the extension enabled — the
   native host process only runs while Chrome keeps it alive.
 extension/      Chrome extension (MV3 service worker, no UI)
-native-host/    Node.js native messaging host + local HTTP/HTTPS proxy
+native-host/    Node.js native messaging host + local HTTP/HTTPS/Websocket proxy
 
 ## Important note
 
-### Consider this tool can not tunnel all request correctly and some request may be failed. For seeing problem check (requests-failed.log) file on native-host folder
+### Consider this tool can not tunnel all request correctly and some request may be failed. For seeing problem check (requests-failed.log) file on native-host folder  
+
 ## Uninstall the tool
 
 ### 1. Remove the extension from Chrome
