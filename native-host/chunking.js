@@ -1,94 +1,76 @@
-// chunking.js — Splits/reassembles large native-messaging payloads.
-//
-// Chrome enforces an undocumented ~1MB cap on a single native-messaging
-// message. Sending (or receiving) anything larger causes the port to
-// silently disconnect ("Error when communicating with the native
-// messaging host"). This showed up in practice whenever VS Code /
-// Marketplace / Copilot needed a response bigger than that (a VSIX
-// package, a large API response, etc) — the extension's fetch() would
-// succeed, but forwarding the result back through native messaging would
-// kill the connection before the client ever saw it.
-//
-// The fix: any message larger than CHUNK_THRESHOLD_BYTES is split into
-// multiple {chunkId, seq, total, data} parts and reassembled on the
-// other end. This mirrors the identical logic in extension/background.js
-// — the two sides can't share a literal file (one runs in Node, the
-// other in a Chrome service worker), so the protocol is kept deliberately
-// simple and duplicated rather than shared.
-
+// Native host -> Chrome is limited to 1 MiB per serialized UTF-8 message.
+// Chrome -> host permits 64 MiB; both ends use the conservative chunk budget.
+// Keep the wire helpers in sync with extension/background.js.
 const CHUNK_THRESHOLD_BYTES = 800 * 1024;
 const CHUNK_SIZE_BYTES = 700 * 1024;
+const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+const MAX_CHUNKS = 512;
 
-/**
- * Sends `message` via `send(msg)`, transparently splitting it into
- * chunks first if it's too large for a single native-messaging payload.
- */
-function sendChunked(send, message, chunkIdPrefix = "host") {
+// Budget the serialized string, including JSON escaping. Envelope overhead
+// remains well below the headroom between 700 KiB and Chrome's 1 MiB limit.
+function splitNativeMessage(message, prefix, byteLength) {
   const json = JSON.stringify(message);
-
-  if (json.length <= CHUNK_THRESHOLD_BYTES) {
-    send(message);
-    return;
+  if (byteLength(json) > MAX_MESSAGE_BYTES) throw new Error("Native message exceeds 64 MiB reassembly limit");
+  if (byteLength(json) <= CHUNK_THRESHOLD_BYTES) return [message];
+  const chunkId = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const parts = [];
+  for (let start = 0; start < json.length;) {
+    let lo = 1, hi = Math.min(CHUNK_SIZE_BYTES, json.length - start), count = 0;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (byteLength(JSON.stringify(json.slice(start, start + mid))) <= CHUNK_SIZE_BYTES) {
+        count = mid; lo = mid + 1;
+      } else hi = mid - 1;
+    }
+    parts.push(json.slice(start, start + count));
+    start += count;
   }
-
-  const chunkId = `${chunkIdPrefix}-${message.id || Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const total = Math.ceil(json.length / CHUNK_SIZE_BYTES);
-  console.error(`[chunking] message for ${chunkId} is ${json.length} bytes, splitting into ${total} chunks`);
-
-  for (let seq = 0; seq < total; seq++) {
-    const data = json.slice(seq * CHUNK_SIZE_BYTES, (seq + 1) * CHUNK_SIZE_BYTES);
-    send({ chunkId, seq, total, data });
-  }
+  if (parts.length > MAX_CHUNKS) throw new Error("Too many native message chunks");
+  return parts.map((data, seq) => ({ chunkId, seq, total: parts.length, data }));
 }
 
-/**
- * Creates a reassembler: call `.handle(message)` for every incoming
- * message. Returns the reassembled JSON-parsed object once all chunks of
- * a chunked message have arrived, or the message itself unchanged if it
- * wasn't chunked. Returns null while still waiting for more chunks.
- */
-function createChunkReassembler() {
+function createBoundedReassembler(byteLength) {
   const buffers = new Map();
-  // Defensive cap: if chunks for some chunkId never complete (a bug, a
-  // dropped connection mid-transfer, etc), the buffer for it stays in
-  // this Map forever. Capping the number of concurrent in-progress
-  // reassemblies bounds worst-case memory growth from that scenario.
-  const MAX_INCOMPLETE_BUFFERS = 50;
-
-  function handle(message) {
-    if (!message || !message.chunkId) {
-      return message; // not chunked, pass through as-is
-    }
-
-    const { chunkId, seq, total, data } = message;
-    let buf = buffers.get(chunkId);
-    if (!buf) {
-      if (buffers.size >= MAX_INCOMPLETE_BUFFERS) {
-        const oldestKey = buffers.keys().next().value;
-        buffers.delete(oldestKey);
-        console.error(
-          `[chunking] too many incomplete reassembly buffers, dropping oldest (${oldestKey}) to make room for ${chunkId}`
-        );
-      }
-      buf = new Array(total).fill(null);
-      buffers.set(chunkId, buf);
-    }
-    buf[seq] = data;
-
-    if (buf.every((part) => part !== null)) {
-      buffers.delete(chunkId);
-      try {
-        return JSON.parse(buf.join(""));
-      } catch (err) {
-        console.error("[chunking] failed to reassemble chunked message:", chunkId, err);
-        return null;
-      }
-    }
-
-    return null; // still waiting for more chunks
+  let bufferedBytes = 0;
+  function drop(id) {
+    const entry = buffers.get(id);
+    if (entry) bufferedBytes -= entry.bytes;
+    buffers.delete(id);
   }
-
+  function handle(message) {
+    if (!message || !Object.prototype.hasOwnProperty.call(message, "chunkId")) return message;
+    const { chunkId, seq, total, data } = message;
+    if (typeof chunkId !== "string" || !chunkId || chunkId.length > 200 ||
+        !Number.isInteger(total) || total < 1 || total > MAX_CHUNKS ||
+        !Number.isInteger(seq) || seq < 0 || seq >= total || typeof data !== "string") {
+      drop(chunkId); return null;
+    }
+    const size = byteLength(data);
+    if (size > 1024 * 1024) { drop(chunkId); return null; }
+    let entry = buffers.get(chunkId);
+    if (entry && entry.parts.length !== total) { drop(chunkId); return null; }
+    if (!entry) {
+      if (buffers.size >= 50) drop(buffers.keys().next().value);
+      entry = { parts: new Array(total).fill(null), count: 0, bytes: 0 };
+      buffers.set(chunkId, entry);
+    }
+    if (entry.parts[seq] !== null) {
+      if (entry.parts[seq] !== data) drop(chunkId);
+      return null;
+    }
+    if (bufferedBytes + size > MAX_MESSAGE_BYTES) { drop(chunkId); return null; }
+    entry.parts[seq] = data; entry.count++; entry.bytes += size; bufferedBytes += size;
+    if (entry.count !== total) return null;
+    drop(chunkId);
+    try { return JSON.parse(entry.parts.join("")); } catch { return null; }
+  }
   return { handle };
 }
 
+function sendChunked(send, message, prefix = "host") {
+  for (const part of splitNativeMessage(message, prefix, text => Buffer.byteLength(text, "utf8"))) send(part);
+}
+function createChunkReassembler() {
+  return createBoundedReassembler(text => Buffer.byteLength(text, "utf8"));
+}
 module.exports = { sendChunked, createChunkReassembler, CHUNK_THRESHOLD_BYTES, CHUNK_SIZE_BYTES };
