@@ -19,6 +19,7 @@
 // on their own.
 
 const forge = require("node-forge");
+const { isIP } = require("net");
 const fs = require("fs");
 const path = require("path");
 
@@ -131,7 +132,7 @@ function getCertificateForHost(hostname) {
     { name: "extKeyUsage", serverAuth: true },
     {
       name: "subjectAltName",
-      altNames: [{ type: 2, value: hostname }], // type 2 = DNS name
+      altNames: [isIP(hostname) ? { type: 7, ip: hostname } : { type: 2, value: hostname }],
     },
   ]);
 
