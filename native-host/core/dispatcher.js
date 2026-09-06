@@ -51,7 +51,7 @@ function createDispatcher({ port, sendToExtension }) {
   const server = http.createServer();
 
   httpProtocol.attach(server, { relayToExtension });
-  httpsProtocol.attach(server, { relayToExtension });
+  httpsProtocol.attach(server, { relayToExtension, relayWsOpen, relayWsMessage, relayWsControl, wsTargets: wsClientTargets });
   wsProtocol.attach(server, { relayWsOpen, relayWsMessage, relayWsControl, wsTargets: wsClientTargets });
 
   // Wire inbound (extension → client) WebSocket traffic to the protocol
