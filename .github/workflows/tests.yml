@@ -39,7 +39,7 @@ jobs:
           set -o pipefail
           mkdir -p test-results
           node tests/run.cjs core 2>&1 | tee test-results/core.tap
-      - name: Bug regression gate (expected red on audited upstream)
+      - name: Regression tests
         if: ${{ !cancelled() }}
         shell: bash
         run: |
