@@ -1,35 +1,5 @@
-// ws-frames.js — minimal RFC 6455 WebSocket frame parser/encoder.
-//
-// Scope: just enough to relay WebSocket traffic between a client speaking
-// to this proxy and the extension's WebSocket (which speaks to the real
-// server through Chrome's network stack). We do NOT implement:
-//   - per-message deflate (permessage-deflate) — extension/per-server
-//     negotiation only, not in our minimal scope. If the client requests
-//     it, we drop that extension from the response and continue.
-//   - fragmentation reassembly beyond a single buffered frame
-//   - 16 MB > payloads (caller chunks). WebSocket base framing supports
-//     up to 2^63, but a 1MB cap is plenty for our use case and keeps
-//     the chunked-handshake with the extension simple.
-//
-// Frame format (RFC 6455 §5):
-//   0                   1                   2                   3
-//   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-//  +-+-+-+-+-------+-+-------------+-------------------------------+
-//  |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
-//  |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
-//  |N|V|V|V|       |S|             |   (if payload len==126/127)   |
-//  | |1|2|3|       |K|             |                               |
-//  +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
-//  |     Extended payload length continued, if payload len == 127  |
-//  + - - - - - - - - - - - - - - - +-------------------------------+
-//  |                               |Masking-key, if MASK set to 1  |
-//  +-------------------------------+-------------------------------+
-//  | Masking-key (continued)       |          Payload Data         |
-//  +-------------------------------- - - - - - - - - - - - - - - - +
-//  :                     Payload Data continued ...                :
-//  + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
-//  |                     Payload Data continued ...                |
-//  +---------------------------------------------------------------+
+// RFC 6455 framing with bounded fragmented-message reassembly.
+// Compression is not negotiated on the local client connection.
 
 const crypto = require("crypto");
 
@@ -48,80 +18,68 @@ const MAX_PAYLOAD_BYTES = 1 * 1024 * 1024; // 1 MiB hard cap per frame
  * complete frames (each as a Buffer) and holds any partial data
  * internally until the rest of the frame arrives.
  */
-function createFrameParser({ maxFrameBytes = MAX_PAYLOAD_BYTES } = {}) {
-  let buffer = Buffer.alloc(0);
-
+function createFrameParser({ maxFrameBytes = MAX_PAYLOAD_BYTES, requireMasked = false } = {}) {
+  let buffer = Buffer.alloc(0), fragmentOpcode = null, fragments = [], fragmentBytes = 0;
   function push(chunk) {
-    if (chunk && chunk.length > 0) {
-      buffer = Buffer.concat([buffer, chunk]);
-    }
+    if (chunk && chunk.length) buffer = Buffer.concat([buffer, chunk]);
     const frames = [];
-    while (tryExtractFrame(frames, maxFrameBytes)) {
-      // loop
+    while (buffer.length >= 2) {
+      const b0 = buffer[0], b1 = buffer[1], fin = Boolean(b0 & 0x80);
+      const opcode = b0 & 0x0f, masked = Boolean(b1 & 0x80);
+      if (b0 & 0x70) throw new Error("Unsupported WebSocket RSV bits");
+      if (![OP_CONTINUATION, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG].includes(opcode)) throw new Error("Invalid WebSocket opcode");
+      if (requireMasked && !masked) throw new Error("Client WebSocket frame must be masked");
+      let size = b1 & 0x7f, offset = 2;
+      if (size === 126) {
+        if (buffer.length < 4) break;
+        size = buffer.readUInt16BE(2); offset = 4;
+        if (size > maxFrameBytes) throw new Error(`WebSocket frame payload ${size} exceeds limit ${maxFrameBytes}`);
+        if (size < 126) throw new Error("Non-minimal WebSocket length");
+      } else if (size === 127) {
+        if (buffer.length < 10) break;
+        if (buffer.readUInt32BE(2) !== 0) throw new Error("WebSocket length overflow / exceeds limit");
+        size = buffer.readUInt32BE(6); offset = 10;
+        if (size < 65536) throw new Error("Non-minimal WebSocket length");
+      }
+      if (size > maxFrameBytes) throw new Error(`WebSocket frame payload ${size} exceeds limit ${maxFrameBytes}`);
+      if (opcode >= 8 && (!fin || size > 125)) throw new Error("Invalid WebSocket control frame");
+      const payloadStart = offset + (masked ? 4 : 0), end = payloadStart + size;
+      if (buffer.length < end) break;
+      let payload = Buffer.from(buffer.subarray(payloadStart, end));
+      if (masked) for (let i = 0; i < size; i++) payload[i] ^= buffer[offset + (i & 3)];
+      buffer = buffer.subarray(end);
+      if (opcode >= 8) {
+        if (opcode === OP_CLOSE) {
+          if (size === 1) throw new Error("Invalid WebSocket close payload");
+          if (size >= 2 && (!validCloseCode(payload.readUInt16BE(0)) || !require("buffer").isUtf8(payload.subarray(2)))) throw new Error("Invalid WebSocket close status/reason");
+        }
+        frames.push({ opcode, payload });
+        continue;
+      }
+      if (opcode === OP_CONTINUATION) {
+        if (fragmentOpcode === null) throw new Error("Unexpected WebSocket continuation");
+      } else {
+        if (fragmentOpcode !== null) throw new Error("Missing WebSocket continuation");
+        fragmentOpcode = opcode;
+      }
+      fragmentBytes += size;
+      if (fragmentBytes > maxFrameBytes) throw new Error("WebSocket fragmented message exceeds limit");
+      fragments.push(payload);
+      if (fin) {
+        payload = Buffer.concat(fragments, fragmentBytes);
+        if (fragmentOpcode === OP_TEXT && !require("buffer").isUtf8(payload)) throw new Error("Invalid WebSocket UTF-8 text");
+        frames.push({ opcode: fragmentOpcode, payload });
+        fragments = []; fragmentBytes = 0; fragmentOpcode = null;
+      }
     }
     return frames;
   }
-
-  function tryExtractFrame(frames, limit) {
-    if (buffer.length < 2) return false;
-
-    const b0 = buffer[0];
-    const b1 = buffer[1];
-    const opcode = b0 & 0x0f;
-    const masked = (b1 & 0x80) !== 0;
-    let payloadLen = b1 & 0x7f;
-    let headerLen = 2;
-
-    if (payloadLen === 126) {
-      if (buffer.length < 4) return false;
-      payloadLen = buffer.readUInt16BE(2);
-      headerLen = 4;
-    } else if (payloadLen === 127) {
-      if (buffer.length < 10) return false;
-      // High bit must be 0 (RFC 6455 §5.2)
-      if (buffer[2] !== 0 || buffer[3] !== 0) {
-        throw new Error("WebSocket frame payload length overflow (MSB set).");
-      }
-      const lo = buffer.readUInt32BE(6);
-      payloadLen = lo;
-      headerLen = 10;
-    }
-
-    if (payloadLen > limit) {
-      throw new Error(
-        `WebSocket frame payload ${payloadLen} exceeds limit ${limit}.`
-      );
-    }
-
-    let maskStart = headerLen;
-    let payloadStart = headerLen;
-    if (masked) {
-      payloadStart = headerLen + 4;
-    }
-    const total = payloadStart + payloadLen;
-    if (buffer.length < total) return false;
-
-    let payload = buffer.subarray(payloadStart, total);
-    if (masked) {
-      const mask = buffer.subarray(maskStart, maskStart + 4);
-      // XOR each byte in place
-      const out = Buffer.alloc(payload.length);
-      for (let i = 0; i < payload.length; i++) {
-        out[i] = payload[i] ^ mask[i & 3];
-      }
-      payload = out;
-    }
-
-    frames.push({ opcode, payload });
-    buffer = buffer.subarray(total);
-    return true;
-  }
-
-  function reset() {
-    buffer = Buffer.alloc(0);
-  }
-
+  function reset() { buffer = Buffer.alloc(0); fragments = []; fragmentBytes = 0; fragmentOpcode = null; }
   return { push, reset };
+}
+
+function validCloseCode(code) {
+  return Number.isInteger(code) && ((code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code)) || (code >= 3000 && code <= 4999));
 }
 
 /**
@@ -184,11 +142,14 @@ function encodeFrame({ opcode, payload, mask = false, maskKey }) {
  * Build a server-side close frame payload (2-byte code + UTF-8 reason).
  */
 function buildClosePayload(code, reason) {
-  if (typeof code !== "number" || !Number.isInteger(code)) code = 1000;
-  const reasonBuf = Buffer.from(String(reason || ""), "utf8");
-  const out = Buffer.alloc(2 + reasonBuf.length);
-  out.writeUInt16BE(code, 0);
-  reasonBuf.copy(out, 2);
+  if (!validCloseCode(code)) code = 1000;
+  let text = "";
+  for (const char of String(reason || "")) {
+    if (Buffer.byteLength(text + char, "utf8") > 123) break;
+    text += char;
+  }
+  const bytes = Buffer.from(text, "utf8"), out = Buffer.alloc(2 + bytes.length);
+  out.writeUInt16BE(code); bytes.copy(out, 2);
   return out;
 }
 
