@@ -13,10 +13,76 @@
 const NATIVE_HOST_NAME = "local.chrometunnel.host";
 const SESSION_KEY_CONNECTED = "chrometunnel_connected";
 
-// Chrome native messaging has a roughly 1 MB single-message limit. Generic
-// outgoing messages larger than this are split and reassembled by host.js.
+// Wire helpers mirror native-host/chunking.js.
 const CHUNK_THRESHOLD_BYTES = 800 * 1024;
 const CHUNK_SIZE_BYTES = 700 * 1024;
+const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+const MAX_CHUNKS = 512;
+
+// Budget the serialized string, including JSON escaping. Envelope overhead
+// remains well below the headroom between 700 KiB and Chrome's 1 MiB limit.
+function splitNativeMessage(message, prefix, byteLength) {
+  const json = JSON.stringify(message);
+  if (byteLength(json) > MAX_MESSAGE_BYTES) throw new Error("Native message exceeds 64 MiB reassembly limit");
+  if (byteLength(json) <= CHUNK_THRESHOLD_BYTES) return [message];
+  const chunkId = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const parts = [];
+  for (let start = 0; start < json.length;) {
+    let lo = 1, hi = Math.min(CHUNK_SIZE_BYTES, json.length - start), count = 0;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (byteLength(JSON.stringify(json.slice(start, start + mid))) <= CHUNK_SIZE_BYTES) {
+        count = mid; lo = mid + 1;
+      } else hi = mid - 1;
+    }
+    parts.push(json.slice(start, start + count));
+    start += count;
+  }
+  if (parts.length > MAX_CHUNKS) throw new Error("Too many native message chunks");
+  return parts.map((data, seq) => ({ chunkId, seq, total: parts.length, data }));
+}
+
+function createBoundedReassembler(byteLength) {
+  const buffers = new Map();
+  let bufferedBytes = 0;
+  function drop(id) {
+    const entry = buffers.get(id);
+    if (entry) bufferedBytes -= entry.bytes;
+    buffers.delete(id);
+  }
+  function handle(message) {
+    if (!message || !Object.prototype.hasOwnProperty.call(message, "chunkId")) return message;
+    const { chunkId, seq, total, data } = message;
+    if (typeof chunkId !== "string" || !chunkId || chunkId.length > 200 ||
+        !Number.isInteger(total) || total < 1 || total > MAX_CHUNKS ||
+        !Number.isInteger(seq) || seq < 0 || seq >= total || typeof data !== "string") {
+      drop(chunkId); return null;
+    }
+    const size = byteLength(data);
+    if (size > 1024 * 1024) { drop(chunkId); return null; }
+    let entry = buffers.get(chunkId);
+    if (entry && entry.parts.length !== total) { drop(chunkId); return null; }
+    if (!entry) {
+      if (buffers.size >= 50) drop(buffers.keys().next().value);
+      entry = { parts: new Array(total).fill(null), count: 0, bytes: 0 };
+      buffers.set(chunkId, entry);
+    }
+    if (entry.parts[seq] !== null) {
+      if (entry.parts[seq] !== data) drop(chunkId);
+      return null;
+    }
+    if (bufferedBytes + size > MAX_MESSAGE_BYTES) { drop(chunkId); return null; }
+    entry.parts[seq] = data; entry.count++; entry.bytes += size; bufferedBytes += size;
+    if (entry.count !== total) return null;
+    drop(chunkId);
+    try { return JSON.parse(entry.parts.join("")); } catch { return null; }
+  }
+  return { handle };
+}
+
+const nativeEncoder = new TextEncoder();
+const nativeByteLength = text => nativeEncoder.encode(text).byteLength;
+const incomingReassembler = createBoundedReassembler(nativeByteLength);
 
 const QUEUE_TIMEOUT_MS = 45_000;
 const REQUEST_TIMEOUTS = Object.freeze({
@@ -76,8 +142,6 @@ let connectInFlight = false;
 
 const pendingResponses = [];
 const MAX_PENDING_RESPONSES = 200;
-const incomingChunkBuffers = new Map();
-const MAX_INCOMPLETE_CHUNK_BUFFERS = 50;
 
 const MAX_CONCURRENT_FETCHES = 6;
 let activeFetchCount = 0;
@@ -126,6 +190,20 @@ function startFetchTask(entry) {
 // the upstream server are forwarded to the native host as
 // { id, wsMessage, isBinary }. Upstream close becomes { id, wsClose }.
 const wsSessions = new Map();
+
+function closeBrowserSocket(ws, { code, reason } = {}) {
+  const legalCode = Number.isInteger(code) && (code === 1000 || (code >= 3000 && code <= 4999)) ? code : 1000;
+  // Browser close reasons have a 123-byte UTF-8 limit; preserve code points.
+  let text = "";
+  for (const char of String(reason || "")) {
+    if (nativeByteLength(text + char) > 123) break;
+    text += char;
+  }
+  try { ws.close(legalCode, text); }
+  catch (err) {
+    try { ws.close(); } catch { console.error("[chrometunnel] ws close failed:", err); }
+  }
+}
 
 function handleWebSocketOpen(message) {
   const { id, url, headers = {} } = message;
@@ -186,6 +264,8 @@ function handleWebSocketOpen(message) {
   const session = { ws, closeOnOpen: null };
   wsSessions.set(id, session);
 
+  ws.binaryType = "arraybuffer"; // Keep binary and text event delivery in order.
+
   ws.onopen = () => {
     // Report accepted. The native host writes the 101 to the client and
     // starts relaying bytes in both directions.
@@ -195,10 +275,10 @@ function handleWebSocketOpen(message) {
     // browser pipeline that fetch() also uses. The browser will reject
     // non-101 handshakes by firing onerror before onopen ever fires,
     // so the absence of an "error" means a successful 101.
-    sendToNative({ id, wsAccepted: true, headers: {} });
+    sendToNative({ id, wsAccepted: true, headers: ws.protocol ? { "sec-websocket-protocol": ws.protocol } : {} });
     if (session.closeOnOpen) {
       try {
-        ws.close(session.closeOnOpen.code, session.closeOnOpen.reason);
+        closeBrowserSocket(ws, session.closeOnOpen);
       } catch (err) {
         console.error("[chrometunnel] deferred ws close failed for", id, err);
       }
@@ -282,8 +362,7 @@ async function ensureConnected() {
 
   connectInFlight = true;
   try {
-    const stored = await chrome.storage.session.get(SESSION_KEY_CONNECTED);
-    if (stored[SESSION_KEY_CONNECTED]) return;
+    // Session storage is diagnostic, not proof this worker owns a live port.
     connect();
   } finally {
     connectInFlight = false;
@@ -332,40 +411,9 @@ async function handleNativeMessage(message) {
     return;
   }
 
-  // Reassemble large incoming request messages from host.js.
-  if (message.chunkId) {
-    const { chunkId, seq, total, data } = message;
-    let buf = incomingChunkBuffers.get(chunkId);
-    if (!buf) {
-      // Defensive cap: bound worst-case memory growth if some chunkId's
-      // transfer never completes (a bug, host.js restarting mid-send).
-      if (incomingChunkBuffers.size >= MAX_INCOMPLETE_CHUNK_BUFFERS) {
-        const oldestKey = incomingChunkBuffers.keys().next().value;
-        incomingChunkBuffers.delete(oldestKey);
-        console.error(
-          `[chrometunnel] too many incomplete reassembly buffers, dropping oldest (${oldestKey}) to make room for ${chunkId}`
-        );
-      }
-      buf = new Array(total).fill(null);
-      incomingChunkBuffers.set(chunkId, buf);
-    }
-    buf[seq] = data;
-
-    if (buf.every((part) => part !== null)) {
-      incomingChunkBuffers.delete(chunkId);
-      let reassembled;
-      try {
-        reassembled = JSON.parse(buf.join(""));
-      } catch (err) {
-        console.error(
-          "[chrometunnel] failed to reassemble chunked message:",
-          chunkId,
-          err
-        );
-        return;
-      }
-      return handleNativeMessage(reassembled);
-    }
+  if (Object.prototype.hasOwnProperty.call(message, "chunkId")) {
+    const complete = incomingReassembler.handle(message);
+    if (complete !== null) return handleNativeMessage(complete);
     return;
   }
 
@@ -390,17 +438,8 @@ async function handleNativeMessage(message) {
     const bytes = base64ToUint8Array(payload || "");
     if (session.ws.readyState === WebSocket.OPEN) {
       try {
-        if (kind === "ping") {
-          // The client sent us a ping; we've already ponged the client.
-          // Forward the same payload to the upstream as a regular
-          // message so end-to-end liveness is still observable there.
-          // Note: the standard WebSocket API (used here, in a Chrome
-          // service worker) has no way to send a true RFC 6455 ping
-          // frame — that control-frame access only exists in Node's
-          // server-side 'ws' library, not in browser/service-worker
-          // WebSocket — so a regular send() is the only option here.
-          session.ws.send(bytes);
-        } else {
+        // The host answers control pings locally. Never turn them into data.
+        if (kind !== "ping" && kind !== "pong") {
           session.ws.send(isBinary ? bytes : new TextDecoder().decode(bytes));
         }
       } catch (err) {
@@ -415,10 +454,7 @@ async function handleNativeMessage(message) {
     const { code, reason } = message.wsClose || {};
     try {
       if (session.ws.readyState === WebSocket.OPEN) {
-        session.ws.close(
-          typeof code === "number" ? code : 1000,
-          typeof reason === "string" ? reason : ""
-        );
+        closeBrowserSocket(session.ws, { code, reason });
       } else if (session.ws.readyState === WebSocket.CONNECTING) {
         // Will be closed by the ws.onopen / ws.onerror path. We can
         // remember the intent and apply on open.
@@ -432,6 +468,8 @@ async function handleNativeMessage(message) {
     }
     return;
   }
+
+  if (id && (message.wsSend || message.wsClose)) return;
 
   if (!url) {
     sendToNative({ id, error: "Missing 'url' in request message." });
@@ -603,43 +641,12 @@ function sendToNative(message) {
     return;
   }
 
-  const json = JSON.stringify(message);
-
-  if (json.length <= CHUNK_THRESHOLD_BYTES) {
-    try {
-      port.postMessage(message);
-    } catch (err) {
-      console.error(
-        "[chrometunnel] postMessage failed, buffering for retry:",
-        err
-      );
-      bufferPendingMessage(message);
-    }
-    return;
-  }
-
-  const chunkId = `ext-${message.id || Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2, 8)}`;
-  const total = Math.ceil(json.length / CHUNK_SIZE_BYTES);
-  console.log(
-    `[chrometunnel] message for ${chunkId} is ${json.length} bytes, splitting into ${total} chunks`
-  );
-
   try {
-    for (let seq = 0; seq < total; seq++) {
-      const data = json.slice(
-        seq * CHUNK_SIZE_BYTES,
-        (seq + 1) * CHUNK_SIZE_BYTES
-      );
-      port.postMessage({ chunkId, seq, total, data });
-    }
+    for (const part of splitNativeMessage(message, "ext", nativeByteLength)) port.postMessage(part);
   } catch (err) {
-    console.error(
-      "[chrometunnel] postMessage failed mid-chunk, buffering whole message for retry:",
-      err
-    );
-    bufferPendingMessage(message);
+    console.error("[chrometunnel] native send failed:", err);
+    // Keep retry buffering bounded by the same individual-message budget.
+    if (nativeByteLength(JSON.stringify(message)) <= MAX_MESSAGE_BYTES) bufferPendingMessage(message);
   }
 }
 
