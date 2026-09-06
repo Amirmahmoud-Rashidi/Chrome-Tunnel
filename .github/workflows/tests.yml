@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: native-host/package-lock.json
+      - name: Install locked production dependency without lifecycle scripts
+        run: npm ci --prefix native-host --ignore-scripts --no-audit --no-fund
+      - name: Check syntax
+        run: node tests/check-syntax.cjs
+      - name: Unit and local integration tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          node tests/run.cjs core 2>&1 | tee test-results/core.tap
+      - name: Bug regression gate (expected red on audited upstream)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          node tests/run.cjs regressions 2>&1 | tee test-results/regressions.tap
+      - name: Upload test output even when regressions fail
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-node-${{ matrix.node }}-${{ matrix.os }}
+          path: test-results/*.tap
+          if-no-files-found: warn
+          retention-days: 14
